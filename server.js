@@ -3,8 +3,6 @@ const express = require('express');
 const { Pool } = require('pg');
 const cors = require('cors');
 const bodyParser = require('body-parser');
-// const { Client, LocalAuth } = require('whatsapp-web.js'); // Désactivé pour Render
-// const qrcode = require('qrcode-terminal'); // Désactivé pour Render
 const axios = require('axios');
 
 const app = express();
@@ -17,7 +15,7 @@ app.use(cors({
 }));
 app.use(bodyParser.json());
 
-// Racine du serveur pour tester si ça marche
+// Racine
 app.get('/', (req, res) => res.send('🚀 Serveur G-CAISSE en ligne !'));
 
 const db = new Pool({
@@ -34,46 +32,33 @@ db.connect((err) => {
     else console.log('🗄️ Connecté à la base de données G-CAISSE');
 });
 
-// --- WHATSAPP DÉSACTIVÉ TEMPORAIREMENT POUR ÉVITER LE CRASH RENDER ---
-/*
-const client = new Client({
-    authStrategy: new LocalAuth(),
-    puppeteer: {
-        handleSIGINT: false,
-        args: ['--no-sandbox', '--disable-setuid-sandbox']
-    }
-});
-
-client.on('qr', (qr) => {
-    qrcode.generate(qr, { small: true });
-    console.log('🌟 Scannez le QR Code');
-});
-
-client.on('ready', () => console.log('✅ Chatbot prêt !'));
-client.initialize();
-*/
-
 // ==========================================
-// 5. ROUTES DE PAIEMENT (MONETBIL)
+// 1. PAIEMENTS (MONETBIL V2.1)
 // ==========================================
 
 app.post('/api/payments/initiate', async (req, res) => {
     const { phone, amount, operator, userId } = req.body;
+    
+    // Ta clé de service exacte
+    const serviceKey = '0vpFvnp2xcxM3kBiHf2EUqtfMmX2PP7B'; 
+
     try {
-        const response = await axios.post('https://api.monetbil.com/payment/v1/placePayment', {
-            service: '0vpFvnp2xcxM3kBiHf2EUqtfMmX2PP7B', 
+        // Nouvelle URL selon la documentation v2.1
+        const response = await axios.post(`https://api.monetbil.com/widget/v2.1/${serviceKey}`, {
             amount: amount,
-            currency: 'XAF',
-            phonenumber: phone,
+            phone: phone,
             operator: operator, 
+            currency: 'XAF',
             item_ref: `USER_${userId}`,
-            description: 'Depot G-Caisse',
-            notify_url: process.env.WEBHOOK_URL || 'https://g-caisse-api.onrender.com/api/payments/webhook'
+            notify_url: process.env.WEBHOOK_URL || 'https://g-caisse-api.onrender.com/api/payments/webhook',
+            return_url: 'https://g-caisse-api.onrender.com/api/health' // Pour rediriger après paiement
         });
+        
+        // Monetbil va renvoyer { success: true, payment_url: "..." }
         res.json(response.data); 
     } catch (error) {
         console.error("Erreur Monetbil:", error.response ? error.response.data : error.message);
-        res.status(500).json({ error: "Echec de l'initialisation du paiement" });
+        res.status(500).json({ error: "Echec Monetbil" });
     }
 });
 
@@ -83,18 +68,51 @@ app.post('/api/payments/webhook', async (req, res) => {
         const userId = item_ref.split('_')[1]; 
         try {
             await db.query("UPDATE users SET balance = balance + $1 WHERE id = $2", [amount, userId]);
-            await db.query(
-                "INSERT INTO transactions (user_id, amount, type, status, method, created_at) VALUES ($1, $2, 'deposit', 'completed', 'mobile_money', NOW())",
-                [userId, amount]
-            );
-            console.log(`✅ Solde mis à jour (+${amount} F)`);
-        } catch (err) { console.error("Erreur mise à jour solde:", err); }
+            await db.query("INSERT INTO transactions (user_id, amount, type, status) VALUES ($1, $2, 'deposit', 'completed')", [userId, amount]);
+            console.log(`✅ Paiement validé pour USER_${userId} : ${amount} XAF`);
+        } catch (err) { console.error(err); }
     }
     res.sendStatus(200);
 });
 
 // ==========================================
-// 6. AUTRES ROUTES API
+// 2. TONTINES & ENCHÈRES (AUCTIONS)
+// ==========================================
+
+app.get('/api/tontines', async (req, res) => {
+    try {
+        const result = await db.query("SELECT * FROM tontines WHERE status = 'active'");
+        res.json(result.rows);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/tontines/:id/auctions', async (req, res) => {
+    try {
+        const result = await db.query("SELECT * FROM auctions WHERE tontine_id = $1 ORDER BY created_at DESC", [req.params.id]);
+        res.json(result.rows);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ==========================================
+// 3. SOCIAL & FONDS
+// ==========================================
+
+app.get('/api/social/fund', async (req, res) => {
+    try {
+        const result = await db.query("SELECT SUM(amount) as total FROM social_funds");
+        res.json({ total: result.rows[0].total || 0 });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/social/events', async (req, res) => {
+    try {
+        const result = await db.query("SELECT * FROM social_events ORDER BY created_at DESC");
+        res.json(result.rows);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ==========================================
+// 4. AUTH & UTILISATEURS
 // ==========================================
 
 app.post('/api/login', async (req, res) => {
@@ -102,17 +120,14 @@ app.post('/api/login', async (req, res) => {
     try {
         const result = await db.query('SELECT * FROM users WHERE phone = $1 AND pincode_hash = $2', [phone, pincode]);
         if (result.rows.length > 0) res.status(200).json(result.rows[0]);
-        else res.status(401).json({ error: "Identifiants incorrects" });
+        else res.status(401).json({ error: "Invalide" });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.post('/api/users', async (req, res) => {
     const { fullname, phone, pincode } = req.body;
     try {
-        const result = await db.query(
-            'INSERT INTO users (fullname, phone, pincode_hash) VALUES ($1, $2, $3) RETURNING id',
-            [fullname, phone, pincode]
-        );
+        const result = await db.query('INSERT INTO users (fullname, phone, pincode_hash) VALUES ($1, $2, $3) RETURNING id', [fullname, phone, pincode]);
         res.status(201).json({ id: result.rows[0].id });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -124,25 +139,7 @@ app.get('/api/users/:id/balance', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.get('/api/tontines', async (req, res) => {
-    try {
-        const result = await db.query("SELECT * FROM tontines WHERE status = 'active'");
-        res.json(result.rows);
-    } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-app.post('/api/tontines', async (req, res) => {
-    const { name, admin_id, frequency, amount, commission_rate } = req.body;
-    try {
-        await db.query(
-            'INSERT INTO tontines (name, admin_id, frequency, amount_to_pay, commission_rate, status) VALUES ($1, $2, $3, $4, $5, \'active\')',
-            [name, admin_id, frequency, amount, commission_rate]
-        );
-        res.sendStatus(201);
-    } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-// Route test simple
-app.get('/api/health', (req, res) => res.json({ status: "ok", message: "Le serveur de Reine fonctionne !" }));
+// Santé du serveur
+app.get('/api/health', (req, res) => res.json({ status: "ok" }));
 
 app.listen(port, () => console.log(`🚀 Serveur G-CAISSE lancé sur le port ${port}`));
