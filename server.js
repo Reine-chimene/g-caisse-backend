@@ -33,46 +33,50 @@ db.connect((err) => {
 });
 
 // ==========================================
-// 1. PAIEMENTS (MONETBIL V2.1)
+// 1. PAIEMENTS (CAMPAY - Côté Backend)
 // ==========================================
 
-app.post('/api/payments/initiate', async (req, res) => {
-    const { phone, amount, operator, userId } = req.body;
-    
-    // Ta clé de service exacte
-    const serviceKey = '0vpFvnp2xcxM3kBiHf2EUqtfMmX2PP7B'; 
+// Route appelée par l'application Flutter pour initier le paiement
+app.post('/api/pay', async (req, res) => {
+    const { phone, amount } = req.body;
+
+    if (!phone || !amount) {
+        return res.status(400).json({ success: false, message: "Numéro de téléphone et montant requis." });
+    }
+
+    // Formatage du numéro (CamPay exige le code pays 237)
+    const formattedPhone = phone.startsWith('237') ? phone : `237${phone}`;
 
     try {
-        // Nouvelle URL selon la documentation v2.1
-        const response = await axios.post(`https://api.monetbil.com/widget/v2.1/${serviceKey}`, {
-            amount: amount,
-            phone: phone,
-            operator: operator, 
-            currency: 'XAF',
-            item_ref: `USER_${userId}`,
-            notify_url: process.env.WEBHOOK_URL || 'https://g-caisse-api.onrender.com/api/payments/webhook',
-            return_url: 'https://g-caisse-api.onrender.com/api/health' // Pour rediriger après paiement
+        // Envoi de la requête de collecte à CamPay
+        const collectResponse = await axios.post('https://demo.campay.net/api/collect/', {
+            amount: amount.toString(),
+            currency: "XAF",
+            from: formattedPhone,
+            description: "Recharge G-Caisse",
+            external_reference: `REF_${Date.now()}` // Référence unique pour cette transaction
+        }, {
+            headers: {
+                // Ton jeton d'accès permanent est gardé secret ici sur le serveur !
+                "Authorization": "Token 352a84f65d57b3416f101ebc1f2d6752ad4050a2", 
+                "Content-Type": "application/json"
+            }
         });
-        
-        // Monetbil va renvoyer { success: true, payment_url: "..." }
-        res.json(response.data); 
-    } catch (error) {
-        console.error("Erreur Monetbil:", error.response ? error.response.data : error.message);
-        res.status(500).json({ error: "Echec Monetbil" });
-    }
-});
 
-app.post('/api/payments/webhook', async (req, res) => {
-    const { status, amount, item_ref } = req.body;
-    if (status === 'success') {
-        const userId = item_ref.split('_')[1]; 
-        try {
-            await db.query("UPDATE users SET balance = balance + $1 WHERE id = $2", [amount, userId]);
-            await db.query("INSERT INTO transactions (user_id, amount, type, status) VALUES ($1, $2, 'deposit', 'completed')", [userId, amount]);
-            console.log(`✅ Paiement validé pour USER_${userId} : ${amount} XAF`);
-        } catch (err) { console.error(err); }
+        // Si la requête est acceptée par CamPay, on renvoie "success: true" à Flutter
+        res.status(200).json({ success: true, data: collectResponse.data });
+        console.log(`✅ Demande de paiement envoyée pour le numéro ${formattedPhone}`);
+
+    } catch (error) {
+        // Capture des erreurs renvoyées par CamPay (solde insuffisant, mauvais numéro, etc.)
+        console.error("Erreur CamPay:", error.response ? error.response.data : error.message);
+        res.status(500).json({ 
+            success: false, 
+            message: error.response && error.response.data.message 
+                     ? error.response.data.message 
+                     : "Erreur lors de la communication avec CamPay." 
+        });
     }
-    res.sendStatus(200);
 });
 
 // ==========================================
@@ -120,7 +124,7 @@ app.post('/api/login', async (req, res) => {
     try {
         const result = await db.query('SELECT * FROM users WHERE phone = $1 AND pincode_hash = $2', [phone, pincode]);
         if (result.rows.length > 0) res.status(200).json(result.rows[0]);
-        else res.status(401).json({ error: "Invalide" });
+        else res.status(401).json({ error: "Identifiants invalides" });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
