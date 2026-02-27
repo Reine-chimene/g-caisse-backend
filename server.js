@@ -33,10 +33,9 @@ db.connect((err) => {
 });
 
 // ==========================================
-// 1. PAIEMENTS (CAMPAY - Côté Backend)
+// 1. PAIEMENTS (CAMPAY - Côté Backend Sécurisé)
 // ==========================================
 
-// Route appelée par l'application Flutter pour initier le paiement
 app.post('/api/pay', async (req, res) => {
     const { phone, amount } = req.body;
 
@@ -44,31 +43,33 @@ app.post('/api/pay', async (req, res) => {
         return res.status(400).json({ success: false, message: "Numéro de téléphone et montant requis." });
     }
 
-    // Formatage du numéro (CamPay exige le code pays 237)
     const formattedPhone = phone.startsWith('237') ? phone : `237${phone}`;
 
     try {
-        // Envoi de la requête de collecte à CamPay
+        // 🔒 VÉRIFICATION DE SÉCURITÉ : On s'assure que la variable d'environnement existe
+        if (!process.env.CAMPAY_TOKEN) {
+            console.error("🚨 ERREUR CRITIQUE : La variable CAMPAY_TOKEN est manquante !");
+            return res.status(500).json({ success: false, message: "Erreur de configuration du serveur de paiement." });
+        }
+
         const collectResponse = await axios.post('https://demo.campay.net/api/collect/', {
             amount: amount.toString(),
             currency: "XAF",
             from: formattedPhone,
             description: "Recharge G-Caisse",
-            external_reference: `REF_${Date.now()}` // Référence unique pour cette transaction
+            external_reference: `REF_${Date.now()}` 
         }, {
             headers: {
-                // Ton jeton d'accès permanent est gardé secret ici sur le serveur !
-                "Authorization": "Token 352a84f65d57b3416f101ebc1f2d6752ad4050a2", 
+                // 🔒 UTILISATION SÉCURISÉE : La clé vient de Render, pas du code source !
+                "Authorization": `Token ${process.env.CAMPAY_TOKEN}`, 
                 "Content-Type": "application/json"
             }
         });
 
-        // Si la requête est acceptée par CamPay, on renvoie "success: true" à Flutter
         res.status(200).json({ success: true, data: collectResponse.data });
         console.log(`✅ Demande de paiement envoyée pour le numéro ${formattedPhone}`);
 
     } catch (error) {
-        // Capture des erreurs renvoyées par CamPay (solde insuffisant, mauvais numéro, etc.)
         console.error("Erreur CamPay:", error.response ? error.response.data : error.message);
         res.status(500).json({ 
             success: false, 
