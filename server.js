@@ -61,7 +61,6 @@ app.get('/api/users/:id/balance', async (req, res) => {
 
 app.get('/api/users/:id/trust-score', async (req, res) => {
     try {
-        // Mis à jour avec ta vraie colonne : credibility_score
         const result = await db.query("SELECT COALESCE(credibility_score, 100) as trust_score FROM public.users WHERE id = $1", [req.params.id]);
         res.json({ trust_score: result.rows[0]?.trust_score || 100 });
     } catch (err) { res.json({ trust_score: 100 }); }
@@ -69,7 +68,6 @@ app.get('/api/users/:id/trust-score', async (req, res) => {
 
 app.get('/api/users/:id/transactions', async (req, res) => {
     try {
-        // La colonne description n'existe pas, on utilise type
         const result = await db.query("SELECT id, amount, type as description, status, created_at FROM public.transactions WHERE user_id = $1 ORDER BY created_at DESC", [req.params.id]);
         res.json(result.rows);
     } catch (err) { res.json([]); } 
@@ -110,7 +108,6 @@ app.post('/api/transfer', async (req, res) => {
         await db.query("UPDATE public.users SET balance = balance - $1 WHERE id = $2", [amount, sender_id]);
         await db.query("UPDATE public.users SET balance = balance + $1 WHERE id = $2", [amount, receiver_id]);
 
-        // Adapté à ta table transactions (pas de colonne description)
         await db.query(`INSERT INTO public.transactions (user_id, amount, type, payment_method, status) VALUES ($1, $2, 'transfer_out', 'wallet', 'completed')`, [sender_id, amount]);
         await db.query(`INSERT INTO public.transactions (user_id, amount, type, payment_method, status) VALUES ($1, $2, 'transfer_in', 'wallet', 'completed')`, [receiver_id, amount]);
 
@@ -133,7 +130,6 @@ app.post('/api/deposit', async (req, res) => {
 app.post('/api/loans/islamic', async (req, res) => {
     const { user_id, amount, purpose } = req.body;
     try {
-        // Mis à jour avec tes colonnes : borrower_id, amount_borrowed
         await db.query("INSERT INTO public.loans (borrower_id, amount_borrowed, status) VALUES ($1, $2, 'pending')", [user_id, amount]);
         res.status(201).json({ success: true });
     } catch (err) { res.status(500).json({ error: err.message }); }
@@ -141,33 +137,81 @@ app.post('/api/loans/islamic', async (req, res) => {
 
 app.get('/api/users/:id/savings', async (req, res) => {
     try {
-        // Mis à jour avec ta table : saving_goals
         const result = await db.query("SELECT * FROM public.saving_goals WHERE user_id = $1", [req.params.id]);
         res.json(result.rows);
     } catch (err) { res.json([]); }
 });
 
 // ==========================================
-// 3. TONTINES & MESSAGERIE
+// 3. TONTINES & MESSAGERIE (MIS À JOUR)
 // ==========================================
 
+// Obtenir LES tontines d'un utilisateur spécifique (via query param) ou TOUTES si pas de user_id
 app.get('/api/tontines', async (req, res) => {
+    const userId = req.query.user_id; 
     try {
-        const result = await db.query("SELECT * FROM public.tontines");
+        let result;
+        if (userId) {
+            // Uniquement les tontines où il est admin ou membre
+            result = await db.query(`
+                SELECT DISTINCT t.* FROM public.tontines t
+                LEFT JOIN public.tontine_members tm ON t.id = tm.tontine_id
+                WHERE t.admin_id = $1 OR tm.user_id = $1
+            `, [userId]);
+        } else {
+            // Si pas de filtre, on renvoie tout (pour compatibilité)
+            result = await db.query("SELECT * FROM public.tontines");
+        }
         res.json(result.rows);
-    } catch (err) { res.json([]); }
+    } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// Créer une tontine et lier l'admin
 app.post('/api/tontines', async (req, res) => {
     const { name, admin_id, frequency, amount, commission_rate } = req.body;
     try {
-        // Mis à jour avec ta colonne : amount_to_pay
-        await db.query(
-            "INSERT INTO public.tontines (name, admin_id, frequency, amount_to_pay, commission_rate) VALUES ($1, $2, $3, $4, $5)",
+        await db.query('BEGIN');
+        
+        // 1. Créer la tontine
+        const tontineRes = await db.query(
+            "INSERT INTO public.tontines (name, admin_id, frequency, amount_to_pay, commission_rate) VALUES ($1, $2, $3, $4, $5) RETURNING id",
             [name, admin_id, frequency, amount, commission_rate]
         );
-        res.status(201).json({ success: true });
-    } catch (err) { res.status(500).json({ error: err.message }); } 
+        const newTontineId = tontineRes.rows[0].id;
+
+        // 2. Ajouter l'admin comme premier membre
+        await db.query(
+            "INSERT INTO public.tontine_members (tontine_id, user_id) VALUES ($1, $2)",
+            [newTontineId, admin_id]
+        );
+
+        await db.query('COMMIT');
+        res.status(201).json({ success: true, id: newTontineId });
+    } catch (err) { 
+        await db.query('ROLLBACK');
+        res.status(500).json({ error: err.message }); 
+    } 
+});
+
+// Quitter une tontine
+app.delete('/api/tontines/:id/leave', async (req, res) => {
+    const { user_id } = req.body; 
+    try {
+        await db.query("DELETE FROM public.tontine_members WHERE tontine_id = $1 AND user_id = $2", [req.params.id, user_id]);
+        res.status(200).json({ success: true, message: "Vous avez quitté la tontine" });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Rejoindre une tontine (Pour tes futures invitations)
+app.post('/api/tontines/:id/join', async (req, res) => {
+    const { user_id } = req.body;
+    try {
+        const check = await db.query("SELECT * FROM public.tontine_members WHERE tontine_id = $1 AND user_id = $2", [req.params.id, user_id]);
+        if (check.rows.length > 0) return res.status(400).json({ message: "Déjà membre" });
+
+        await db.query("INSERT INTO public.tontine_members (tontine_id, user_id) VALUES ($1, $2)", [req.params.id, user_id]);
+        res.status(200).json({ success: true });
+    } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.get('/api/tontines/:id/members', async (req, res) => {
@@ -179,7 +223,6 @@ app.get('/api/tontines/:id/members', async (req, res) => {
 
 app.get('/api/tontines/:id/messages', async (req, res) => {
     try {
-        // Mis à jour avec ta table : group_messages
         const result = await db.query("SELECT * FROM public.group_messages WHERE tontine_id = $1 ORDER BY created_at ASC", [req.params.id]);
         res.json(result.rows);
     } catch (err) { res.json([]); }
