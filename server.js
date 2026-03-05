@@ -92,27 +92,68 @@ app.put('/api/users/:id', async (req, res) => {
 // 2. FINANCE (TRANSFERTS, PRÊTS, ÉPARGNE)
 // ==========================================
 
+// ✅ VRAIE ROUTE DE RETRAIT VIA NOTCH PAY (Transfers API)
 app.post('/api/transfer', async (req, res) => {
     const { sender_id, receiver_phone, amount } = req.body;
     if (amount <= 0) return res.status(400).json({ error: "Montant invalide" });
 
     try {
         await db.query('BEGIN');
-        const senderRes = await db.query("SELECT balance, phone FROM public.users WHERE id = $1", [sender_id]);
-        if (senderRes.rows.length === 0 || senderRes.rows[0].balance < amount) throw new Error("Solde insuffisant");
+        
+        // 1. Vérifier le solde G-Caisse du demandeur
+        const senderRes = await db.query("SELECT balance, fullname FROM public.users WHERE id = $1", [sender_id]);
+        
+        if (senderRes.rows.length === 0 || senderRes.rows[0].balance < amount) {
+            throw new Error("Solde G-Caisse insuffisant");
+        }
 
-        const receiverRes = await db.query("SELECT id FROM public.users WHERE phone LIKE '%' || $1", [receiver_phone]);
-        if (receiverRes.rows.length === 0) throw new Error("Destinataire introuvable");
-        const receiver_id = receiverRes.rows[0].id;
+        const userName = senderRes.rows[0].fullname || "Membre G-Caisse";
+        
+        // 2. Préparer les données pour Notch Pay
+        const cleanPhone = receiver_phone.replace(/\D/g, ''); 
+        let channel = "cm.mtn"; 
+        // Si ça commence par 655, 656, 657, 658, 659, 69, c'est Orange
+        if (/^(237)?(655|656|657|658|659|69|685|686|687|688|689)/.test(cleanPhone)) {
+            channel = "cm.orange";
+        }
 
-        await db.query("UPDATE public.users SET balance = balance - $1 WHERE id = $2", [amount, sender_id]);
-        await db.query("UPDATE public.users SET balance = balance + $1 WHERE id = $2", [amount, receiver_id]);
+        // 3. Appel de la Transfers API de Notch Pay (Création de bénéficiaire incluse)
+        try {
+            const notchRes = await axios.post('https://api.notchpay.co/transfers', {
+                amount: amount,
+                currency: "XAF",
+                beneficiary_data: {
+                    name: userName,
+                    phone: `+237${cleanPhone.replace(/^237/, '')}` // S'assurer du format +237...
+                },
+                channel: channel,
+                description: "Retrait depuis G-Caisse",
+                reference: `WD_${sender_id}_${Date.now()}`
+            }, {
+                headers: {
+                    'Authorization': process.env.NOTCHPAY_PUBLIC_KEY, 
+                    'X-Grant': process.env.NOTCHPAY_PRIVATE_KEY, // Sécurité obligatoire !
+                    'Content-Type': 'application/json'
+                }
+            });
 
-        await db.query(`INSERT INTO public.transactions (user_id, amount, type, payment_method, status) VALUES ($1, $2, 'transfer_out', 'wallet', 'completed')`, [sender_id, amount]);
-        await db.query(`INSERT INTO public.transactions (user_id, amount, type, payment_method, status) VALUES ($1, $2, 'transfer_in', 'wallet', 'completed')`, [receiver_id, amount]);
+            // 4. Si Notch Pay a accepté la demande, on déduit l'argent côté G-Caisse
+            await db.query("UPDATE public.users SET balance = balance - $1 WHERE id = $2", [amount, sender_id]);
+            
+            await db.query(
+                `INSERT INTO public.transactions (user_id, amount, type, payment_method, status) VALUES ($1, $2, 'withdrawal', 'momo', 'completed')`, 
+                [sender_id, amount]
+            );
 
-        await db.query('COMMIT');
-        res.status(200).json({ success: true, message: "Transfert effectué" });
+            await db.query('COMMIT');
+            res.status(200).json({ success: true, message: "Retrait initié avec succès" });
+
+        } catch (notchError) {
+            // Si Notch Pay refuse (Solde insuffisant chez eux, IP bloquée, numéro invalide...)
+            console.error("Erreur Notch Pay:", notchError.response?.data || notchError.message);
+            throw new Error(notchError.response?.data?.message || "Erreur de transfert de l'opérateur");
+        }
+
     } catch (err) {
         await db.query('ROLLBACK');
         res.status(400).json({ success: false, message: err.message });
@@ -143,43 +184,37 @@ app.get('/api/users/:id/savings', async (req, res) => {
 });
 
 // ==========================================
-// 3. TONTINES & MESSAGERIE (MIS À JOUR)
+// 3. TONTINES & MESSAGERIE
 // ==========================================
 
-// Obtenir LES tontines d'un utilisateur spécifique (via query param) ou TOUTES si pas de user_id
 app.get('/api/tontines', async (req, res) => {
     const userId = req.query.user_id; 
     try {
         let result;
         if (userId) {
-            // Uniquement les tontines où il est admin ou membre
             result = await db.query(`
                 SELECT DISTINCT t.* FROM public.tontines t
                 LEFT JOIN public.tontine_members tm ON t.id = tm.tontine_id
                 WHERE t.admin_id = $1 OR tm.user_id = $1
             `, [userId]);
         } else {
-            // Si pas de filtre, on renvoie tout (pour compatibilité)
             result = await db.query("SELECT * FROM public.tontines");
         }
         res.json(result.rows);
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Créer une tontine et lier l'admin
 app.post('/api/tontines', async (req, res) => {
     const { name, admin_id, frequency, amount, commission_rate } = req.body;
     try {
         await db.query('BEGIN');
         
-        // 1. Créer la tontine
         const tontineRes = await db.query(
             "INSERT INTO public.tontines (name, admin_id, frequency, amount_to_pay, commission_rate) VALUES ($1, $2, $3, $4, $5) RETURNING id",
             [name, admin_id, frequency, amount, commission_rate]
         );
         const newTontineId = tontineRes.rows[0].id;
 
-        // 2. Ajouter l'admin comme premier membre
         await db.query(
             "INSERT INTO public.tontine_members (tontine_id, user_id) VALUES ($1, $2)",
             [newTontineId, admin_id]
@@ -193,7 +228,6 @@ app.post('/api/tontines', async (req, res) => {
     } 
 });
 
-// Quitter une tontine
 app.delete('/api/tontines/:id/leave', async (req, res) => {
     const { user_id } = req.body; 
     try {
@@ -202,7 +236,6 @@ app.delete('/api/tontines/:id/leave', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Rejoindre une tontine (Pour tes futures invitations)
 app.post('/api/tontines/:id/join', async (req, res) => {
     const { user_id } = req.body;
     try {
@@ -271,7 +304,7 @@ app.post('/api/social/donate', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Initialiser le paiement
+// Initialiser le paiement Notch Pay (DÉPÔT)
 app.post('/api/pay', async (req, res) => {
     const { amount, phone, name, email } = req.body;
     try {
@@ -286,22 +319,40 @@ app.post('/api/pay', async (req, res) => {
     } catch (error) { res.status(500).json({ message: "Erreur NotchPay" }); }
 });
 
-// Webhook
-app.post('/api/webhook', async (req, res) => {
-    const event = req.body;
-    res.status(200).send('OK');
+// WEBHOOK
+app.post('/api/webhook', express.raw({type: 'application/json'}), async (req, res) => {
+    res.status(200).send('Webhook received');
+    
     try {
-        if ((event.type || event.event) === 'payment.complete') {
+        const event = req.body; 
+
+        // Traitement des dépôts réussis
+        if (event && event.type === 'payment.complete' && event.data) {
             const amount = event.data.amount;
-            const phoneFragment = event.data.reference.split('_')[1];
+            const referenceParts = event.data.reference.split('_');
+            const phoneFragment = referenceParts.length > 1 ? referenceParts[1] : null;
+
             if (phoneFragment) {
-                const user = await db.query("UPDATE public.users SET balance = balance + $1 WHERE phone LIKE '%' || $2 RETURNING id", [amount, phoneFragment]);
+                console.log(`Paiement reçu : ${amount} FCFA pour le numéro ${phoneFragment}`);
+                const user = await db.query(
+                    "UPDATE public.users SET balance = balance + $1 WHERE phone LIKE '%' || $2 RETURNING id", 
+                    [amount, phoneFragment]
+                );
+
                 if (user.rows.length > 0) {
-                    await db.query("INSERT INTO public.transactions (user_id, amount, type, payment_method, status) VALUES ($1, $2, 'cotisation', 'momo', 'completed')", [user.rows[0].id, amount]);
+                    const userId = user.rows[0].id;
+                    await db.query(
+                        "INSERT INTO public.transactions (user_id, amount, type, payment_method, status) VALUES ($1, $2, 'deposit', 'momo', 'completed')", 
+                        [userId, amount]
+                    );
                 }
             }
         }
-    } catch (err) { console.error("Webhook Erreur:", err.message); }
+        
+        // On pourrait aussi gérer les transfer.complete ici plus tard si nécessaire
+    } catch (err) { 
+        console.error("Webhook Erreur:", err.message); 
+    }
 });
 
 app.listen(port, () => console.log(`🚀 Serveur G-CAISSE sur le port ${port}`));
