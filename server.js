@@ -304,7 +304,7 @@ app.post('/api/social/donate', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Initialiser le paiement Notch Pay (DÉPÔT)
+// ✅ CORRECTION DÉPÔT : Utilisation de NOTCHPAY_PUBLIC_KEY
 app.post('/api/pay', async (req, res) => {
     const { amount, phone, name, email } = req.body;
     try {
@@ -314,9 +314,17 @@ app.post('/api/pay', async (req, res) => {
             customer: { name: name || "Membre", email: email || "contact@g-caisse.cm", phone: phone },
             reference: `REF_${cleanPhone}_${Date.now()}`,
             callback: "https://g-caisse-api.onrender.com/"
-        }, { headers: { "Authorization": process.env.NOTCHPAY_KEY, "Content-Type": "application/json" }});
+        }, { 
+            headers: { 
+                "Authorization": process.env.NOTCHPAY_PUBLIC_KEY, 
+                "Content-Type": "application/json" 
+            }
+        });
         res.json({ success: true, payment_url: response.data.authorization_url });
-    } catch (error) { res.status(500).json({ message: "Erreur NotchPay" }); }
+    } catch (error) { 
+        console.error("Erreur NotchPay Dépôt:", error.response?.data || error.message);
+        res.status(500).json({ message: "Erreur NotchPay" }); 
+    }
 });
 
 // WEBHOOK
@@ -348,11 +356,18 @@ app.post('/api/webhook', express.raw({type: 'application/json'}), async (req, re
                 }
             }
         }
-        
-        // On pourrait aussi gérer les transfer.complete ici plus tard si nécessaire
     } catch (err) { 
         console.error("Webhook Erreur:", err.message); 
     }
 });
 
-app.listen(port, () => console.log(`🚀 Serveur G-CAISSE sur le port ${port}`));
+// ✅ CORRECTION LOGS : Affichage de l'IP Render pour pouvoir l'ajouter à la liste blanche Notch Pay
+app.listen(port, async () => {
+    console.log(`🚀 Serveur G-CAISSE sur le port ${port}`);
+    try {
+        const ipResponse = await axios.get('https://api.ipify.org');
+        console.log(`🌍 >>> MON ADRESSE IP RENDER EST : ${ipResponse.data} <<< 🌍`);
+    } catch (e) {
+        console.log("Impossible de récupérer l'IP");
+    }
+});
