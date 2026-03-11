@@ -4,6 +4,8 @@ const { Pool } = require('pg');
 const cors = require('cors');
 const bodyParser = require('body-parser');
 const axios = require('axios');
+// ✅ AJOUT DE STRIPE
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -89,8 +91,27 @@ app.put('/api/users/:id', async (req, res) => {
 });
 
 // ==========================================
-// 2. FINANCE (TRANSFERTS, PRÊTS, ÉPARGNE)
+// 2. FINANCE (TRANSFERTS, PRÊTS, ÉPARGNE, STRIPE)
 // ==========================================
+
+// ✅ NOUVELLE ROUTE : CREER UN INTENT DE PAIEMENT STRIPE (CARTE BANCAIRE)
+app.post('/api/create-payment-intent', async (req, res) => {
+    const { amount, currency, user_id } = req.body;
+    try {
+        // Stripe utilise les centimes (ex: 1000 XAF = 1000)
+        // Note: Stripe ne supporte pas nativement le XAF pour tous les comptes, 
+        // vérifie ta devise par défaut (souvent EUR ou USD converted)
+        const paymentIntent = await stripe.paymentIntents.create({
+            amount: amount,
+            currency: currency || 'eur', 
+            metadata: { user_id: user_id.toString() }
+        });
+
+        res.json({ clientSecret: paymentIntent.client_secret });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
 
 // ✅ VRAIE ROUTE DE RETRAIT VIA NOTCH PAY (Transfers API)
 app.post('/api/transfer', async (req, res) => {
@@ -100,7 +121,6 @@ app.post('/api/transfer', async (req, res) => {
     try {
         await db.query('BEGIN');
         
-        // 1. Vérifier le solde G-Caisse du demandeur
         const senderRes = await db.query("SELECT balance, fullname FROM public.users WHERE id = $1", [sender_id]);
         
         if (senderRes.rows.length === 0 || senderRes.rows[0].balance < amount) {
@@ -108,23 +128,19 @@ app.post('/api/transfer', async (req, res) => {
         }
 
         const userName = senderRes.rows[0].fullname || "Membre G-Caisse";
-        
-        // 2. Préparer les données pour Notch Pay
         const cleanPhone = receiver_phone.replace(/\D/g, ''); 
         let channel = "cm.mtn"; 
-        // Si ça commence par 655, 656, 657, 658, 659, 69, c'est Orange
         if (/^(237)?(655|656|657|658|659|69|685|686|687|688|689)/.test(cleanPhone)) {
             channel = "cm.orange";
         }
 
-        // 3. Appel de la Transfers API de Notch Pay (Création de bénéficiaire incluse)
         try {
             const notchRes = await axios.post('https://api.notchpay.co/transfers', {
                 amount: amount,
                 currency: "XAF",
                 beneficiary_data: {
                     name: userName,
-                    phone: `+237${cleanPhone.replace(/^237/, '')}` // S'assurer du format +237...
+                    phone: `+237${cleanPhone.replace(/^237/, '')}`
                 },
                 channel: channel,
                 description: "Retrait depuis G-Caisse",
@@ -132,12 +148,11 @@ app.post('/api/transfer', async (req, res) => {
             }, {
                 headers: {
                     'Authorization': process.env.NOTCHPAY_PUBLIC_KEY, 
-                    'X-Grant': process.env.NOTCHPAY_PRIVATE_KEY, // Sécurité obligatoire !
+                    'X-Grant': process.env.NOTCHPAY_PRIVATE_KEY,
                     'Content-Type': 'application/json'
                 }
             });
 
-            // 4. Si Notch Pay a accepté la demande, on déduit l'argent côté G-Caisse
             await db.query("UPDATE public.users SET balance = balance - $1 WHERE id = $2", [amount, sender_id]);
             
             await db.query(
@@ -149,7 +164,6 @@ app.post('/api/transfer', async (req, res) => {
             res.status(200).json({ success: true, message: "Retrait initié avec succès" });
 
         } catch (notchError) {
-            // Si Notch Pay refuse (Solde insuffisant chez eux, IP bloquée, numéro invalide...)
             console.error("Erreur Notch Pay:", notchError.response?.data || notchError.message);
             throw new Error(notchError.response?.data?.message || "Erreur de transfert de l'opérateur");
         }
@@ -304,7 +318,6 @@ app.post('/api/social/donate', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ✅ CORRECTION DÉPÔT : Utilisation de NOTCHPAY_PUBLIC_KEY
 app.post('/api/pay', async (req, res) => {
     const { amount, phone, name, email } = req.body;
     try {
@@ -327,14 +340,12 @@ app.post('/api/pay', async (req, res) => {
     }
 });
 
-// WEBHOOK
 app.post('/api/webhook', express.raw({type: 'application/json'}), async (req, res) => {
     res.status(200).send('Webhook received');
     
     try {
         const event = req.body; 
 
-        // Traitement des dépôts réussis
         if (event && event.type === 'payment.complete' && event.data) {
             const amount = event.data.amount;
             const referenceParts = event.data.reference.split('_');
@@ -361,7 +372,6 @@ app.post('/api/webhook', express.raw({type: 'application/json'}), async (req, re
     }
 });
 
-// ✅ CORRECTION LOGS : Affichage de l'IP Render pour pouvoir l'ajouter à la liste blanche Notch Pay
 app.listen(port, async () => {
     console.log(`🚀 Serveur G-CAISSE sur le port ${port}`);
     try {
