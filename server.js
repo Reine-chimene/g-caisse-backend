@@ -203,7 +203,6 @@ app.get('/api/users/:id/savings', async (req, res) => {
 // 3. TONTINES & MESSAGERIE
 // ==========================================
 
-// ✅ CORRECTION ICI : Ajout du calcul 'member_count' pour le radar Flutter
 app.get('/api/tontines', async (req, res) => {
     const userId = req.query.user_id; 
     try {
@@ -329,7 +328,6 @@ app.post('/api/social/donate', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ✅ UN SEUL APPEL DE PAIEMENT (Nettoyé des doublons)
 app.post('/api/pay', async (req, res) => {
     const { amount, phone, name, email } = req.body;
     try {
@@ -352,10 +350,8 @@ app.post('/api/pay', async (req, res) => {
     }
 });
 
-// ✅ UN SEUL WEBHOOK PUISSANT (Gère Notchpay et les commissions 2%)
 app.post('/api/webhook', async (req, res) => {
     const event = req.body;
-    // Notchpay renvoie parfois "event.event" ou "event.type" selon la version
     const eventType = event.event || event.type; 
 
     if (eventType === 'payment.complete') {
@@ -365,9 +361,6 @@ app.post('/api/webhook', async (req, res) => {
         const phoneFragment = reference.split('_')[1];
 
         try {
-            console.log(`Paiement reçu : ${amount} FCFA pour le numéro ${phoneFragment}`);
-            
-            // Crédit direct (les 2% restent côté admin stats)
             const userUpdate = await db.query(
                 "UPDATE public.users SET balance = balance + $1 WHERE phone LIKE '%' || $2 RETURNING id", 
                 [amount, phoneFragment]
@@ -386,6 +379,41 @@ app.post('/api/webhook', async (req, res) => {
         }
     } else {
         res.status(200).send('Ignored');
+    }
+});
+
+// ==========================================
+// 5. GÉOLOCALISATION (RADAR) - ✅ AJOUTÉ ICI
+// ==========================================
+
+// Route pour mettre à jour la position GPS d'un utilisateur
+app.post('/api/users/:id/location', async (req, res) => {
+    const { latitude, longitude } = req.body;
+    try {
+        await db.query(
+            "UPDATE public.users SET latitude = $1, longitude = $2 WHERE id = $3",
+            [latitude, longitude, req.params.id]
+        );
+        res.status(200).json({ success: true, message: "Position mise à jour" });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Route pour récupérer les positions des membres d'une tontine spécifique
+app.get('/api/tontines/:id/locations', async (req, res) => {
+    try {
+        const result = await db.query(`
+            SELECT u.id, u.fullname, u.latitude, u.longitude 
+            FROM public.users u 
+            JOIN public.tontine_members tm ON u.id = tm.user_id 
+            WHERE tm.tontine_id = $1 
+            AND u.latitude IS NOT NULL 
+            AND u.longitude IS NOT NULL
+        `, [req.params.id]);
+        res.json(result.rows);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
     }
 });
 
