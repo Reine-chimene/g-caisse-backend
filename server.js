@@ -134,12 +134,24 @@ app.post('/api/users', async (req, res) => {
 app.post('/api/login', async (req, res) => {
     const { phone, pincode } = req.body;
     try {
-        const result = await db.query("SELECT * FROM public.users WHERE phone LIKE '%' || $1 AND pincode_hash = $2", [phone, pincode]);
-        if (result.rows.length > 0) res.status(200).json(result.rows[0]);
-        else res.status(401).json({ message: "Identifiants incorrects" });
-    } catch (err) { res.status(500).json({ message: err.message }); }
-});
+        // Recherche exacte (plus fiable que LIKE %)
+        const result = await db.query(
+            "SELECT id, fullname, phone, balance, credibility_score FROM public.users WHERE (phone = $1 OR phone = '237' || $1) AND pincode_hash = $2", 
+            [phone, pincode]
+        );
 
+        if (result.rows.length > 0) {
+            // Renvoie l'objet utilisateur DIRECTEMENT
+            return res.status(200).json(result.rows[0]);
+        } else {
+            // Message d'erreur clair pour le catch de Flutter
+            return res.status(401).json({ message: "Numéro ou PIN incorrect" });
+        }
+    } catch (err) {
+        console.error("Erreur Login:", err.message);
+        return res.status(500).json({ message: "Erreur serveur" });
+    }
+});
 app.get('/api/users/:id/balance', async (req, res) => {
     try {
         const result = await db.query("SELECT balance FROM public.users WHERE id = $1", [req.params.id]);
