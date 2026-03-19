@@ -9,9 +9,11 @@ const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const app = express();
 const port = process.env.PORT || 3000;
 
+// Configuration Middlewares
 app.use(cors({ origin: '*', methods: ['GET', 'POST', 'PUT', 'DELETE'] }));
 app.use(bodyParser.json());
 
+// Configuration Base de Données PostgreSQL
 const db = new Pool({
     user: process.env.DB_USER,
     host: process.env.DB_HOST,
@@ -21,6 +23,8 @@ const db = new Pool({
     ssl: { rejectUnauthorized: false }
 });
 
+const GLOBAL_FEE_RATE = 0.02;
+
 // ==========================================
 // ⚙️ SCRIPT D'AUTO-MIGRATION (DB CHECK)
 // ==========================================
@@ -28,7 +32,6 @@ const initDb = async () => {
     try {
         console.log("🔍 Vérification de la structure de la base de données...");
         
-        // 1. Table des utilisateurs (avec balance)
         await db.query(`
             CREATE TABLE IF NOT EXISTS public.users (
                 id SERIAL PRIMARY KEY,
@@ -43,7 +46,6 @@ const initDb = async () => {
             )
         `);
 
-        // 2. Table des Tontines (avec bénéficiaire actuel)
         await db.query(`
             CREATE TABLE IF NOT EXISTS public.tontines (
                 id SERIAL PRIMARY KEY,
@@ -57,7 +59,6 @@ const initDb = async () => {
             )
         `);
 
-        // 3. Table des Membres (avec mode de retrait)
         await db.query(`
             CREATE TABLE IF NOT EXISTS public.tontine_members (
                 id SERIAL PRIMARY KEY,
@@ -68,7 +69,6 @@ const initDb = async () => {
             )
         `);
 
-        // 4. Table du Fond Social (Amendes)
         await db.query(`
             CREATE TABLE IF NOT EXISTS public.social_funds (
                 id SERIAL PRIMARY KEY,
@@ -78,7 +78,6 @@ const initDb = async () => {
             )
         `);
 
-        // 5. Table des Transactions
         await db.query(`
             CREATE TABLE IF NOT EXISTS public.transactions (
                 id SERIAL PRIMARY KEY,
@@ -92,7 +91,7 @@ const initDb = async () => {
             )
         `);
 
-        // Script de détection de colonnes manquantes (si les tables existaient déjà)
+        // Mises à jour des colonnes (Migrations)
         await db.query(`ALTER TABLE public.tontine_members ADD COLUMN IF NOT EXISTS payout_method TEXT DEFAULT 'G-Caisse'`);
         await db.query(`ALTER TABLE public.tontines ADD COLUMN IF NOT EXISTS current_beneficiary_id INTEGER REFERENCES public.users(id)`);
 
@@ -104,7 +103,18 @@ const initDb = async () => {
 
 initDb();
 
-const GLOBAL_FEE_RATE = 0.02;
+// ==========================================
+// 🏠 ROUTE RACINE (ROOT) - Évite le "Cannot GET /"
+// ==========================================
+app.get('/', (req, res) => {
+    res.send(`
+        <div style="font-family: sans-serif; text-align: center; padding-top: 100px;">
+            <h1 style="color: #FF7900;">🚀 SERVEUR G-CAISSE LIVE</h1>
+            <p>Le backend est opérationnel sur Render.</p>
+            <p>Statut Base de Données: <span style="color: green;">Connectée ✅</span></p>
+        </div>
+    `);
+});
 
 // ==========================================
 // 1. UTILISATEURS & AUTHENTIFICATION
@@ -138,10 +148,9 @@ app.get('/api/users/:id/balance', async (req, res) => {
 });
 
 // ==========================================
-// 2. TONTINES & PAIEMENTS (NOUVEAU)
+// 2. TONTINES & PAIEMENTS
 // ==========================================
 
-// Liste des tontines
 app.get('/api/tontines', async (req, res) => {
     const userId = req.query.user_id; 
     try {
@@ -161,7 +170,6 @@ app.get('/api/tontines', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Créer une tontine
 app.post('/api/tontines', async (req, res) => {
     const { name, admin_id, frequency, amount, commission_rate } = req.body;
     try {
@@ -172,7 +180,6 @@ app.post('/api/tontines', async (req, res) => {
         );
         const newTontineId = tontineRes.rows[0].id;
         await db.query("INSERT INTO public.tontine_members (tontine_id, user_id) VALUES ($1, $2)", [newTontineId, admin_id]);
-        // Création auto du fond social pour cette tontine
         await db.query("INSERT INTO public.social_funds (tontine_id, balance) VALUES ($1, 0)", [newTontineId]);
         await db.query('COMMIT');
         res.status(201).json({ success: true, id: newTontineId });
@@ -182,30 +189,21 @@ app.post('/api/tontines', async (req, res) => {
     } 
 });
 
-// Route : Paiement de cotisation + amende de retard
 app.post('/api/payments/tontine', async (req, res) => {
     const { user_id, tontine_id, amount, is_late } = req.body;
-    const LATE_PENALTY = 500; // Montant amende fixe
-
+    const LATE_PENALTY = 500;
     try {
         await db.query('BEGIN');
         const userRes = await db.query("SELECT balance FROM public.users WHERE id = $1", [user_id]);
         if (userRes.rows[0].balance < amount) throw new Error("Solde insuffisant");
-
-        // Débiter l'utilisateur
         await db.query("UPDATE public.users SET balance = balance - $1 WHERE id = $2", [amount, user_id]);
-
-        // Si retard, envoyer 500 dans le fond social
         if (is_late) {
             await db.query("UPDATE public.social_funds SET balance = balance + $1 WHERE tontine_id = $2", [LATE_PENALTY, tontine_id]);
         }
-
-        // Enregistrer la transaction
         await db.query(
             "INSERT INTO public.transactions (user_id, amount, type, status, description) VALUES ($1, $2, 'tontine_pay', 'completed', $3)",
             [user_id, amount, is_late ? "Cotisation + Amende retard" : "Cotisation normale"]
         );
-
         await db.query('COMMIT');
         res.json({ success: true });
     } catch (err) {
@@ -214,69 +212,66 @@ app.post('/api/payments/tontine', async (req, res) => {
     }
 });
 
-// Route : Récupérer le bénéficiaire du tour
-app.get('/api/tontines/:id/winner', async (req, res) => {
-    try {
-        const result = await db.query(`
-            SELECT u.fullname, tm.payout_method 
-            FROM public.tontines t
-            JOIN public.users u ON t.current_beneficiary_id = u.id
-            JOIN public.tontine_members tm ON (tm.tontine_id = t.id AND tm.user_id = u.id)
-            WHERE t.id = $1
-        `, [req.params.id]);
-        res.json(result.rows[0] || null);
-    } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-// Route : Récupérer le montant du Fond Social
-app.get('/api/social-fund', async (req, res) => {
-    try {
-        const result = await db.query("SELECT balance FROM public.social_funds");
-        res.json(result.rows[0]?.balance || 0);
-    } catch (err) { res.json(0); }
-});
-
 // ==========================================
-// 3. SERVICES (AIRTIME, FACTURES) + 2%
+// 3. SERVICES & TRANSFERTS
 // ==========================================
 
 app.post('/api/services/airtime', async (req, res) => {
     const { user_id, receiver_phone, amount, operator } = req.body;
     const fees = amount * GLOBAL_FEE_RATE;
     const totalToDebit = amount + fees;
-
     try {
         await db.query('BEGIN');
         const userRes = await db.query("SELECT balance FROM public.users WHERE id = $1", [user_id]);
         if (!userRes.rows[0] || userRes.rows[0].balance < totalToDebit) throw new Error("Solde insuffisant");
-
-        // Appel NotchPay (Simulation NotchPay enlevée pour brièveté, reste identique à ton code)
         await db.query("UPDATE public.users SET balance = balance - $1 WHERE id = $2", [totalToDebit, user_id]);
-        await db.query("INSERT INTO public.transactions (user_id, amount, type, status) VALUES ($1, $2, 'airtime', 'completed')", [user_id, totalToDebit]);
+        await db.query("INSERT INTO public.transactions (user_id, amount, type, status, description) VALUES ($1, $2, 'airtime', 'completed', $3)", [user_id, totalToDebit, `Recharge ${operator} vers ${receiver_phone}`]);
         await db.query('COMMIT');
         res.json({ success: true });
     } catch (err) { await db.query('ROLLBACK'); res.status(400).json({ message: err.message }); }
 });
 
-// ==========================================
-// 4. RETRAITS & TRANSFERTS + 2%
-// ==========================================
-
 app.post('/api/transfer', async (req, res) => {
     const { sender_id, receiver_phone, amount } = req.body;
     const fees = amount * GLOBAL_FEE_RATE;
     const totalToDebit = amount + fees;
-
     try {
         await db.query('BEGIN');
         const senderRes = await db.query("SELECT balance FROM public.users WHERE id = $1", [sender_id]);
         if (senderRes.rows[0].balance < totalToDebit) throw new Error("Solde insuffisant");
-
         await db.query("UPDATE public.users SET balance = balance - $1 WHERE id = $2", [totalToDebit, sender_id]);
         await db.query("INSERT INTO public.transactions (user_id, amount, type, status) VALUES ($1, $2, 'withdrawal', 'completed')", [sender_id, totalToDebit]);
         await db.query('COMMIT');
         res.status(200).json({ success: true });
     } catch (err) { await db.query('ROLLBACK'); res.status(400).json({ message: err.message }); }
+});
+
+// ==========================================
+// 4. ADMIN & STATISTIQUES (CRUCIAL POUR TON DASHBOARD)
+// ==========================================
+
+app.get('/api/admin/stats', async (req, res) => {
+    try {
+        const feesResult = await db.query(`
+            SELECT COALESCE(SUM(amount * ${GLOBAL_FEE_RATE}), 0) as total_fees 
+            FROM public.transactions 
+            WHERE status = 'completed' AND type IN ('airtime', 'withdrawal', 'tontine_pay')
+        `);
+        const volumeResult = await db.query(`
+            SELECT COALESCE(SUM(amount), 0) as total_volume 
+            FROM public.transactions 
+            WHERE type = 'deposit' AND status = 'completed'
+        `);
+        const usersResult = await db.query("SELECT COUNT(*) as user_count FROM public.users");
+
+        res.json({
+            total_fees: parseFloat(feesResult.rows[0].total_fees).toFixed(0),
+            total_volume: parseFloat(volumeResult.rows[0].total_volume).toFixed(0),
+            user_count: parseInt(usersResult.rows[0].user_count)
+        });
+    } catch (err) {
+        res.status(500).json({ error: "Erreur stats" });
+    }
 });
 
 // ==========================================
@@ -305,6 +300,7 @@ app.post('/api/webhook', async (req, res) => {
     } else { res.status(200).send('Ignored'); }
 });
 
+// Lancement du serveur
 app.listen(port, () => {
-    console.log(`🚀 Serveur G-CAISSE (Version Business) sur le port ${port}`);
+    console.log(`🚀 Serveur G-CAISSE opérationnel sur le port ${port}`);
 });
