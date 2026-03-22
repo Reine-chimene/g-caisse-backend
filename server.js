@@ -91,10 +91,6 @@ const initDb = async () => {
             )
         `);
 
-        // Mises à jour des colonnes (Migrations)
-        await db.query(`ALTER TABLE public.tontine_members ADD COLUMN IF NOT EXISTS payout_method TEXT DEFAULT 'G-Caisse'`);
-        await db.query(`ALTER TABLE public.tontines ADD COLUMN IF NOT EXISTS current_beneficiary_id INTEGER REFERENCES public.users(id)`);
-
         console.log("✅ Base de données prête et à jour.");
     } catch (err) {
         console.error("❌ Erreur lors de l'initialisation de la DB:", err);
@@ -104,7 +100,7 @@ const initDb = async () => {
 initDb();
 
 // ==========================================
-// 🏠 ROUTE RACINE (ROOT) - Évite le "Cannot GET /"
+// 🏠 ROUTE RACINE (ROOT)
 // ==========================================
 app.get('/', (req, res) => {
     res.send(`
@@ -134,17 +130,14 @@ app.post('/api/users', async (req, res) => {
 app.post('/api/login', async (req, res) => {
     const { phone, pincode } = req.body;
     try {
-        // Recherche exacte (plus fiable que LIKE %)
         const result = await db.query(
             "SELECT id, fullname, phone, balance, credibility_score FROM public.users WHERE (phone = $1 OR phone = '237' || $1) AND pincode_hash = $2", 
             [phone, pincode]
         );
 
         if (result.rows.length > 0) {
-            // Renvoie l'objet utilisateur DIRECTEMENT
             return res.status(200).json(result.rows[0]);
         } else {
-            // Message d'erreur clair pour le catch de Flutter
             return res.status(401).json({ message: "Numéro ou PIN incorrect" });
         }
     } catch (err) {
@@ -152,6 +145,7 @@ app.post('/api/login', async (req, res) => {
         return res.status(500).json({ message: "Erreur serveur" });
     }
 });
+
 app.get('/api/users/:id/balance', async (req, res) => {
     try {
         const result = await db.query("SELECT balance FROM public.users WHERE id = $1", [req.params.id]);
@@ -201,46 +195,62 @@ app.post('/api/tontines', async (req, res) => {
     } 
 });
 
-app.post('/api/payments/tontine', async (req, res) => {
-    const { user_id, tontine_id, amount, is_late } = req.body;
-    const LATE_PENALTY = 500;
+// ==========================================
+// 3. TRANSFERTS & RETRAITS (NOTCH PAY)
+// ==========================================
+
+// --- NOUVELLE ROUTE DE RETRAIT CORRIGÉE ---
+app.post('/api/payout', async (req, res) => {
+    const { user_id, amount, phone, name, channel } = req.body;
+    const reference = `PAY-${Date.now()}-${user_id}`;
+
     try {
         await db.query('BEGIN');
+
+        // 1. Vérifier le solde de l'utilisateur
         const userRes = await db.query("SELECT balance FROM public.users WHERE id = $1", [user_id]);
-        if (userRes.rows[0].balance < amount) throw new Error("Solde insuffisant");
-        await db.query("UPDATE public.users SET balance = balance - $1 WHERE id = $2", [amount, user_id]);
-        if (is_late) {
-            await db.query("UPDATE public.social_funds SET balance = balance + $1 WHERE tontine_id = $2", [LATE_PENALTY, tontine_id]);
+        if (!userRes.rows[0] || userRes.rows[0].balance < amount) {
+            throw new Error("Solde G-Caisse insuffisant pour ce retrait");
         }
+
+        // 2. Appel Notch Pay avec structure BENEFICIARY correcte (Pas de 422 ici !)
+        const notchResponse = await axios.post('https://api.notchpay.co/transfers', {
+            amount: amount,
+            currency: 'XAF',
+            channel: channel || 'cm.mobile',
+            beneficiary: {
+                phone: phone,
+                name: name
+            },
+            reference: reference,
+            description: `Retrait G-Caisse de ${name}`
+        }, {
+            headers: {
+                'Authorization': process.env.NOTCH_PUBLIC_KEY,
+                'X-Grant': process.env.NOTCH_PRIVATE_KEY, // Requis pour les virements
+                'Content-Type': 'application/json',
+                'Accept': 'application/json'
+            }
+        });
+
+        // 3. Débiter le compte G-Caisse et enregistrer la transaction pour l'AUDIT
+        await db.query("UPDATE public.users SET balance = balance - $1 WHERE id = $2", [amount, user_id]);
         await db.query(
-            "INSERT INTO public.transactions (user_id, amount, type, status, description) VALUES ($1, $2, 'tontine_pay', 'completed', $3)",
-            [user_id, amount, is_late ? "Cotisation + Amende retard" : "Cotisation normale"]
+            "INSERT INTO public.transactions (user_id, amount, type, status, reference, description) VALUES ($1, $2, $3, $4, $5, $6)",
+            [user_id, amount, 'withdrawal', 'processing', reference, `Retrait Notch Pay (${channel})`]
         );
+
         await db.query('COMMIT');
-        res.json({ success: true });
+        res.status(200).json({ success: true, data: notchResponse.data });
+
     } catch (err) {
         await db.query('ROLLBACK');
-        res.status(400).json({ message: err.message });
+        console.error("Erreur Payout:", err.response?.data || err.message);
+        res.status(400).json({ 
+            success: false, 
+            message: err.response?.data?.message || err.message 
+        });
     }
-});
-
-// ==========================================
-// 3. SERVICES & TRANSFERTS
-// ==========================================
-
-app.post('/api/services/airtime', async (req, res) => {
-    const { user_id, receiver_phone, amount, operator } = req.body;
-    const fees = amount * GLOBAL_FEE_RATE;
-    const totalToDebit = amount + fees;
-    try {
-        await db.query('BEGIN');
-        const userRes = await db.query("SELECT balance FROM public.users WHERE id = $1", [user_id]);
-        if (!userRes.rows[0] || userRes.rows[0].balance < totalToDebit) throw new Error("Solde insuffisant");
-        await db.query("UPDATE public.users SET balance = balance - $1 WHERE id = $2", [totalToDebit, user_id]);
-        await db.query("INSERT INTO public.transactions (user_id, amount, type, status, description) VALUES ($1, $2, 'airtime', 'completed', $3)", [user_id, totalToDebit, `Recharge ${operator} vers ${receiver_phone}`]);
-        await db.query('COMMIT');
-        res.json({ success: true });
-    } catch (err) { await db.query('ROLLBACK'); res.status(400).json({ message: err.message }); }
 });
 
 app.post('/api/transfer', async (req, res) => {
@@ -251,15 +261,19 @@ app.post('/api/transfer', async (req, res) => {
         await db.query('BEGIN');
         const senderRes = await db.query("SELECT balance FROM public.users WHERE id = $1", [sender_id]);
         if (senderRes.rows[0].balance < totalToDebit) throw new Error("Solde insuffisant");
+        
         await db.query("UPDATE public.users SET balance = balance - $1 WHERE id = $2", [totalToDebit, sender_id]);
-        await db.query("INSERT INTO public.transactions (user_id, amount, type, status) VALUES ($1, $2, 'withdrawal', 'completed')", [sender_id, totalToDebit]);
+        // Correction : On crédite le receveur s'il existe
+        await db.query("UPDATE public.users SET balance = balance + $1 WHERE phone = $2", [amount, receiver_phone]);
+        
+        await db.query("INSERT INTO public.transactions (user_id, amount, type, status) VALUES ($1, $2, 'transfer', 'completed')", [sender_id, totalToDebit]);
         await db.query('COMMIT');
         res.status(200).json({ success: true });
     } catch (err) { await db.query('ROLLBACK'); res.status(400).json({ message: err.message }); }
 });
 
 // ==========================================
-// 4. ADMIN & STATISTIQUES (CRUCIAL POUR TON DASHBOARD)
+// 4. ADMIN & STATISTIQUES
 // ==========================================
 
 app.get('/api/admin/stats', async (req, res) => {
@@ -299,19 +313,57 @@ app.get('/api/users/:id/transactions', async (req, res) => {
 
 app.post('/api/webhook', async (req, res) => {
     const event = req.body;
+    
+    // 1. Gestion des Dépôts (Entrée d'argent)
     if (event.event === 'payment.complete') {
-        const { amount, reference } = event.data;
-        const phoneFragment = reference.split('_')[1];
-        try {
-            const userUpdate = await db.query("UPDATE public.users SET balance = balance + $1 WHERE phone LIKE '%' || $2 RETURNING id", [amount, phoneFragment]);
-            if (userUpdate.rows.length > 0) {
-                await db.query("INSERT INTO public.transactions (user_id, amount, type, status) VALUES ($1, $2, 'deposit', 'completed')", [userUpdate.rows[0].id, amount]);
-            }
-            res.status(200).send('OK');
-        } catch (err) { res.status(500).send('Error'); }
-    } else { res.status(200).send('Ignored'); }
-});
+        const { amount, reference, status } = event.data;
+        
+        // On suppose que ta référence est formatée comme ceci : "DEP_USERID_TIMESTAMP"
+        // Exemple : "DEP_12_1711123456" pour l'utilisateur ID 12
+        const parts = reference.split('_');
+        const userId = parts[1]; 
 
+        try {
+            await db.query('BEGIN');
+
+            // Vérifier si cette transaction n'a pas déjà été traitée (Anti-doublon)
+            const checkTx = await db.query("SELECT id FROM public.transactions WHERE reference = $1", [reference]);
+            
+            if (checkTx.rows.length === 0) {
+                // Créditer l'utilisateur
+                const userUpdate = await db.query(
+                    "UPDATE public.users SET balance = balance + $1 WHERE id = $2 RETURNING id", 
+                    [amount, userId]
+                );
+
+                if (userUpdate.rows.length > 0) {
+                    // Enregistrer dans l'audit (Table transactions)
+                    await db.query(
+                        "INSERT INTO public.transactions (user_id, amount, type, status, reference, description) VALUES ($1, $2, 'deposit', 'completed', $3, $4)", 
+                        [userId, amount, 'deposit', 'completed', reference, 'Dépôt Notch Pay']
+                    );
+                    console.log(`✅ Dépôt réussi pour l'User ${userId} : +${amount} XAF`);
+                }
+            }
+
+            await db.query('COMMIT');
+            return res.status(200).send('Webhook Processed');
+        } catch (err) {
+            await db.query('ROLLBACK');
+            console.error("❌ Erreur Webhook Dépôt:", err.message);
+            return res.status(500).send('Internal Server Error');
+        }
+    } 
+
+    // 2. Gestion des Retraits (Confirmation de sortie d'argent)
+    else if (event.event === 'transfer.complete') {
+        const { reference } = event.data;
+        await db.query("UPDATE public.transactions SET status = 'completed' WHERE reference = $1", [reference]);
+        return res.status(200).send('Payout Confirmed');
+    }
+
+    res.status(200).send('Event Ignored');
+});
 // Lancement du serveur
 app.listen(port, () => {
     console.log(`🚀 Serveur G-CAISSE opérationnel sur le port ${port}`);
