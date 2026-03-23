@@ -165,7 +165,7 @@ app.get('/api/tontines', async (req, res) => {
         let result;
         if (userId && userId !== 'null' && userId !== 'undefined') {
             result = await db.query(`
-                SELECT DISTINCT t.*,
+                SELECT DISTINCT t.*, t.amount_to_pay as amount,
                 (SELECT COUNT(*) FROM public.tontine_members WHERE tontine_id = t.id) as member_count
                 FROM public.tontines t
                 LEFT JOIN public.tontine_members tm ON t.id = tm.tontine_id
@@ -175,7 +175,7 @@ app.get('/api/tontines', async (req, res) => {
         } else {
             // Si pas d'ID, on montre toutes les tontines publiques
             result = await db.query(`
-                SELECT t.*, 
+                SELECT t.*, t.amount_to_pay as amount,
                 (SELECT COUNT(*) FROM public.tontine_members WHERE tontine_id = t.id) as member_count 
                 FROM public.tontines t 
                 ORDER BY t.created_at DESC
@@ -343,7 +343,7 @@ app.post('/api/deposit', async (req, res) => {
             }
         });
 
-        res.json({ url: response.data.authorization_url });
+        res.json({ success: true, payment_url: response.data.authorization_url });
     } catch (err) {
         console.error("Erreur Initialisation Dépôt:", err.response?.data || err.message);
         res.status(400).json({ error: "Impossible d'initialiser le paiement" });
