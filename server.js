@@ -159,23 +159,34 @@ app.get('/api/users/:id/balance', async (req, res) => {
 
 app.get('/api/tontines', async (req, res) => {
     const userId = req.query.user_id; 
+    console.log("🔍 Requête tontines pour l'utilisateur ID:", userId); // Pour débugger dans Render
+
     try {
         let result;
-        if (userId) {
+        if (userId && userId !== 'null' && userId !== 'undefined') {
             result = await db.query(`
                 SELECT DISTINCT t.*,
                 (SELECT COUNT(*) FROM public.tontine_members WHERE tontine_id = t.id) as member_count
                 FROM public.tontines t
                 LEFT JOIN public.tontine_members tm ON t.id = tm.tontine_id
                 WHERE t.admin_id = $1 OR tm.user_id = $1
-            `, [userId]);
+                ORDER BY t.created_at DESC
+            `, [parseInt(userId)]); // On force l'ID en entier
         } else {
-            result = await db.query(`SELECT t.*, (SELECT COUNT(*) FROM public.tontine_members WHERE tontine_id = t.id) as member_count FROM public.tontines t`);
+            // Si pas d'ID, on montre toutes les tontines publiques
+            result = await db.query(`
+                SELECT t.*, 
+                (SELECT COUNT(*) FROM public.tontine_members WHERE tontine_id = t.id) as member_count 
+                FROM public.tontines t 
+                ORDER BY t.created_at DESC
+            `);
         }
         res.json(result.rows || []);
-    } catch (err) { res.status(500).json({ error: err.message }); }
+    } catch (err) { 
+        console.error("❌ Erreur GET tontines:", err.message);
+        res.status(500).json({ error: err.message }); 
+    }
 });
-
 app.post('/api/tontines', async (req, res) => {
     const { name, admin_id, frequency, amount, commission_rate } = req.body;
     try {
@@ -309,6 +320,34 @@ app.get('/api/users/:id/transactions', async (req, res) => {
         const result = await db.query("SELECT * FROM public.transactions WHERE user_id = $1 ORDER BY created_at DESC", [req.params.id]);
         res.json(result.rows || []);
     } catch (err) { res.json([]); } 
+});
+
+app.post('/api/deposit', async (req, res) => {
+    const { amount, phone, user_id, email, name } = req.body;
+    const reference = `DEP_${user_id}_${Date.now()}`; // Format CRUCIAL pour ton webhook
+
+    try {
+        const response = await axios.post('https://api.notchpay.co/payments/initialize', {
+            amount: amount,
+            currency: 'XAF',
+            reference: reference,
+            callback: 'https://google.com', // URL de retour après paiement
+            customer: {
+                email: email || `${phone}@g-caisse.com`,
+                name: name
+            }
+        }, {
+            headers: {
+                'Authorization': process.env.NOTCH_PUBLIC_KEY, // Ta clé publique
+                'Accept': 'application/json'
+            }
+        });
+
+        res.json({ url: response.data.authorization_url });
+    } catch (err) {
+        console.error("Erreur Initialisation Dépôt:", err.response?.data || err.message);
+        res.status(400).json({ error: "Impossible d'initialiser le paiement" });
+    }
 });
 
 app.post('/api/webhook', async (req, res) => {
