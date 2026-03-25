@@ -15,7 +15,6 @@ const db = require('./db');
 
 const app = express();
 const port = process.env.PORT || 3000;
-const GLOBAL_FEE_RATE = 0.02;
 const SALT_ROUNDS = 10;
 
 // ==========================================
@@ -52,14 +51,12 @@ const uploadVoice = multer({
 // ==========================================
 // MIDDLEWARES
 // ==========================================
-// CORRECTION CORS ICI : Autorise toutes les origines pour éviter l'erreur "CORS non autorisé"
 app.use(cors({
     origin: '*',
     methods: ['GET', 'POST', 'PUT', 'DELETE'],
     allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
-// Utilisation du raw body pour le webhook (validation HMAC)
 app.use((req, res, next) => {
     if (req.path === '/api/webhook') return next();
     bodyParser.json()(req, res, next);
@@ -87,15 +84,13 @@ const requireFields = (...fields) => (req, res, next) => {
 };
 
 // ==========================================
-// INITIALISATION BASE DE DONNÉES (Tables)
+// INITIALISATION BASE DE DONNÉES
 // ==========================================
 const initDb = async () => {
     try {
         console.log("🔍 Initialisation DB...");
-        // On crée les tables principales si elles n'existent pas
         await db.query(`CREATE TABLE IF NOT EXISTS public.users (id SERIAL PRIMARY KEY, fullname TEXT, phone TEXT UNIQUE, pincode_hash TEXT, balance DECIMAL DEFAULT 0, credibility_score INTEGER DEFAULT 100, latitude DOUBLE PRECISION, longitude DOUBLE PRECISION, fcm_token TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`);
         await db.query(`CREATE TABLE IF NOT EXISTS public.transactions (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES public.users(id), amount DECIMAL, type TEXT, status TEXT, reference TEXT, description TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`);
-        // ... (Ajouter les autres tables tontines, loans, etc. selon tes besoins)
         console.log("✅ Base de données prête.");
     } catch (err) {
         console.error("❌ Erreur DB:", err);
@@ -104,33 +99,69 @@ const initDb = async () => {
 initDb();
 
 // ==========================================
-// ROUTES API (Auth, Tontines, Transferts)
+// ROUTES AUTHENTIFICATION
+// ==========================================
+
+// INSCRIPTION (Nécessaire pour hacher le code PIN correctement)
+app.post('/api/register', requireFields('fullname', 'phone', 'pincode'), async (req, res) => {
+    const { fullname, phone, pincode } = req.body;
+    try {
+        const pincode_hash = await bcrypt.hash(String(pincode), SALT_ROUNDS);
+        const result = await db.query(
+            "INSERT INTO public.users (fullname, phone, pincode_hash) VALUES ($1, $2, $3) RETURNING id, fullname, phone",
+            [fullname, phone, pincode_hash]
+        );
+        res.status(201).json(result.rows[0]);
+    } catch (err) {
+        if (err.code === '23505') return res.status(400).json({ message: "Ce numéro existe déjà" });
+        res.status(500).json({ message: "Erreur lors de l'inscription" });
+    }
+});
+
+// LOGIN (Corrigé avec logs de débogage)
+app.post('/api/login', requireFields('phone', 'pincode'), async (req, res) => {
+    const { phone, pincode } = req.body;
+    console.log(`[AUTH] Tentative de connexion pour: ${phone}`);
+
+    try {
+        // Recherche souple : avec ou sans le préfixe 237
+        const result = await db.query(
+            "SELECT * FROM public.users WHERE phone = $1 OR phone = '237' || $1 OR '237' || phone = $1", 
+            [phone]
+        );
+
+        if (result.rows.length === 0) {
+            console.log(`[AUTH] Échec: Utilisateur non trouvé (${phone})`);
+            return res.status(401).json({ message: "Identifiants incorrects" });
+        }
+
+        const user = result.rows[0];
+        const match = await bcrypt.compare(String(pincode), user.pincode_hash);
+
+        if (!match) {
+            console.log(`[AUTH] Échec: PIN incorrect pour ${phone}`);
+            return res.status(401).json({ message: "Identifiants incorrects" });
+        }
+
+        const token = jwt.sign({ id: user.id, phone: user.phone }, process.env.JWT_SECRET, { expiresIn: '7d' });
+        delete user.pincode_hash;
+        
+        console.log(`[AUTH] Succès: ${user.fullname} est connecté`);
+        res.json({ ...user, token });
+    } catch (err) {
+        console.error("[SERVER ERROR]", err);
+        res.status(500).json({ message: "Erreur serveur" });
+    }
+});
+
+// ==========================================
+// AUTRES ROUTES (Dépôt & Webhook)
 // ==========================================
 
 app.get('/', (req, res) => {
     res.send('<h1 style="color: #FF7900; text-align: center;">🚀 SERVEUR G-CAISSE LIVE OPERATIONAL</h1>');
 });
 
-// LOGIN
-app.post('/api/login', requireFields('phone', 'pincode'), async (req, res) => {
-    const { phone, pincode } = req.body;
-    try {
-        const result = await db.query("SELECT * FROM public.users WHERE phone = $1 OR phone = '237' || $1", [phone]);
-        if (result.rows.length === 0) return res.status(401).json({ message: "Identifiants incorrects" });
-
-        const user = result.rows[0];
-        const match = await bcrypt.compare(String(pincode), user.pincode_hash);
-        if (!match) return res.status(401).json({ message: "Identifiants incorrects" });
-
-        const token = jwt.sign({ id: user.id, phone: user.phone }, process.env.JWT_SECRET, { expiresIn: '7d' });
-        delete user.pincode_hash;
-        res.json({ ...user, token });
-    } catch (err) {
-        res.status(500).json({ message: "Erreur serveur" });
-    }
-});
-
-// DÉPÔT NOTCH PAY
 app.post('/api/deposit', authenticate, requireFields('amount', 'user_id', 'name'), async (req, res) => {
     const { amount, user_id, name, email, phone } = req.body;
     const reference = `DEP_${user_id}_${Date.now()}`;
@@ -148,18 +179,15 @@ app.post('/api/deposit', authenticate, requireFields('amount', 'user_id', 'name'
     }
 });
 
-// WEBHOOK FINALISÉ
 app.post('/api/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
     const signature = req.headers['x-notch-signature'];
     const rawBody = req.body.toString();
-
     if (!signature || !process.env.NOTCH_WEBHOOK_SECRET) return res.status(401).send('Unauthorized');
 
     const calculatedSig = crypto.createHmac('sha256', process.env.NOTCH_WEBHOOK_SECRET).update(rawBody).digest('hex');
     if (calculatedSig !== signature) return res.status(400).send('Invalid signature');
 
     const event = JSON.parse(rawBody);
-
     if (event.type === 'payment.complete') {
         const { amount, reference } = event.data;
         const userId = reference.split('_')[1];
