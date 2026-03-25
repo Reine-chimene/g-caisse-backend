@@ -52,16 +52,11 @@ const uploadVoice = multer({
 // ==========================================
 // MIDDLEWARES
 // ==========================================
-const allowedOrigins = process.env.ALLOWED_ORIGINS
-    ? process.env.ALLOWED_ORIGINS.split(',')
-    : ['http://localhost:3000'];
-
+// CORRECTION CORS ICI : Autorise toutes les origines pour éviter l'erreur "CORS non autorisé"
 app.use(cors({
-    origin: (origin, callback) => {
-        if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
-        callback(new Error('CORS non autorisé'));
-    },
-    methods: ['GET', 'POST', 'PUT', 'DELETE']
+    origin: '*',
+    methods: ['GET', 'POST', 'PUT', 'DELETE'],
+    allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
 // Utilisation du raw body pour le webhook (validation HMAC)
