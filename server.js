@@ -119,41 +119,49 @@ app.post('/api/register', requireFields('fullname', 'phone', 'pincode'), async (
 });
 
 // LOGIN (Corrigé avec logs de débogage)
-app.post('/api/login', requireFields('phone', 'pincode'), async (req, res) => {
+// Route de connexion (Version sans hachage pour test)
+app.post('/api/login', async (req, res) => {
     const { phone, pincode } = req.body;
-    console.log(`[AUTH] Tentative de connexion pour: ${phone}`);
 
     try {
-        // Recherche souple : avec ou sans le préfixe 237
+        // Recherche de l'utilisateur par téléphone
         const result = await db.query(
-            "SELECT * FROM public.users WHERE phone = $1 OR phone = '237' || $1 OR '237' || phone = $1", 
+            "SELECT * FROM public.users WHERE phone = $1", 
             [phone]
         );
 
         if (result.rows.length === 0) {
-            console.log(`[AUTH] Échec: Utilisateur non trouvé (${phone})`);
-            return res.status(401).json({ message: "Identifiants incorrects" });
+            return res.status(401).json({ message: "Utilisateur non trouvé" });
         }
 
         const user = result.rows[0];
-        const match = await bcrypt.compare(String(pincode), user.pincode_hash);
 
-        if (!match) {
-            console.log(`[AUTH] Échec: PIN incorrect pour ${phone}`);
-            return res.status(401).json({ message: "Identifiants incorrects" });
+        // COMPARAISON DIRECTE (Texte brut)
+        // On compare ce que l'utilisateur a tapé avec la colonne pincode_hash
+        if (String(pincode) !== String(user.pincode_hash)) {
+            return res.status(401).json({ message: "Code PIN incorrect" });
         }
 
-        const token = jwt.sign({ id: user.id, phone: user.phone }, process.env.JWT_SECRET, { expiresIn: '7d' });
+        // Création du token JWT pour les prochaines requêtes
+        const token = jwt.sign(
+            { id: user.id, phone: user.phone }, 
+            process.env.JWT_SECRET || 'votre_cle_secrete', 
+            { expiresIn: '7d' }
+        );
+
+        // On retire le code PIN de l'objet avant de l'envoyer au téléphone
         delete user.pincode_hash;
-        
-        console.log(`[AUTH] Succès: ${user.fullname} est connecté`);
-        res.json({ ...user, token });
+
+        res.json({
+            ...user,
+            token: token
+        });
+
     } catch (err) {
-        console.error("[SERVER ERROR]", err);
-        res.status(500).json({ message: "Erreur serveur" });
+        console.error(err);
+        res.status(500).json({ message: "Erreur serveur lors de la connexion" });
     }
 });
-
 // ==========================================
 // AUTRES ROUTES (Dépôt & Webhook)
 // ==========================================
