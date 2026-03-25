@@ -48,7 +48,7 @@ const uploadVoice = multer({
     }
 });
 
-const app = express();
+
 const port = process.env.PORT || 3000;
 const GLOBAL_FEE_RATE = 0.02;
 const SALT_ROUNDS = 10;
