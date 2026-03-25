@@ -206,6 +206,24 @@ app.post('/api/tontines', async (req, res) => {
     } 
 });
 
+app.put('/api/tontines/:id', async (req, res) => {
+    const { id } = req.params;
+    const { name, frequency, amount_to_pay } = req.body;
+    try {
+        const result = await db.query(
+            'UPDATE public.tontines SET name = $1, frequency = $2, amount_to_pay = $3 WHERE id = $4 RETURNING *',
+            [name, frequency, amount_to_pay, id]
+        );
+        if (result.rows.length > 0) {
+            const tontine = result.rows[0];
+            tontine.amount = tontine.amount_to_pay; // Pour la cohérence avec la route GET
+            res.status(200).json(tontine);
+        } else {
+            res.status(404).json({ error: "Tontine non trouvée" });
+        }
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // ==========================================
 // 3. TRANSFERTS & RETRAITS (NOTCH PAY)
 // ==========================================
