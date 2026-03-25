@@ -161,6 +161,47 @@ app.post('/api/login', async (req, res) => {
         res.status(500).json({ message: "Erreur serveur" });
     }
 
+// ==========================================
+// ROUTES TONTINES (AJOUTÉES)
+// ==========================================
+
+// 1. RÉCUPÉRER TOUTES LES TONTINES
+app.get('/api/tontines', authenticate, async (req, res) => {
+    try {
+        // On récupère les tontines actives. 
+        // Si tu veux filtrer par utilisateur, utilise req.query.user_id
+        const result = await db.query(
+            "SELECT * FROM public.tontines WHERE status = 'active' ORDER BY created_at DESC"
+        );
+        
+        console.log(`[TONTINE] ${result.rows.length} tontines trouvées`);
+        res.json(result.rows); 
+    } catch (err) {
+        console.error("Erreur SQL tontines:", err.message);
+        res.status(500).json({ message: "Erreur lors de la récupération des tontines" });
+    }
+});
+
+// 2. CRÉER UNE TONTINE
+app.post('/api/tontines', authenticate, requireFields('name', 'admin_id', 'frequency', 'amount'), async (req, res) => {
+    const { name, admin_id, frequency, amount, commission_rate } = req.body;
+    
+    try {
+        const query = `
+            INSERT INTO public.tontines (name, admin_id, frequency, amount_to_pay, commission_rate, status)
+            VALUES ($1, $2, $3, $4, $5, 'active')
+            RETURNING *`;
+        
+        const values = [name, admin_id, frequency, amount, commission_rate || 0];
+        const result = await db.query(query, values);
+        
+        res.status(201).json(result.rows[0]);
+    } catch (err) {
+        console.error("Erreur création tontine:", err.message);
+        res.status(500).json({ message: "Échec de la création" });
+    }
+});
+
 });
 // ==========================================
 // AUTRES ROUTES (Dépôt & Webhook)
