@@ -86,18 +86,24 @@ const initDb = async () => {
         await db.query(`CREATE TABLE IF NOT EXISTS public.users (
             id SERIAL PRIMARY KEY, fullname TEXT, phone TEXT UNIQUE,
             pincode_hash TEXT, balance DECIMAL DEFAULT 0,
-            credibility_score INTEGER DEFAULT 100,
+            credibility_score INTEGER DEFAULT 50,
             latitude DOUBLE PRECISION, longitude DOUBLE PRECISION,
             fcm_token TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )`);
         await db.query(`CREATE TABLE IF NOT EXISTS public.tontines (
             id SERIAL PRIMARY KEY, name TEXT, admin_id INTEGER REFERENCES public.users(id),
             frequency TEXT, amount_to_pay DECIMAL, commission_rate DECIMAL DEFAULT 0,
-            status TEXT DEFAULT 'active', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            status TEXT DEFAULT 'active',
+            deadline_time TEXT DEFAULT '23:59',
+            deadline_day INTEGER DEFAULT 28,
+            has_caisse_fund BOOLEAN DEFAULT false,
+            caisse_fund_amount DECIMAL DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )`);
         await db.query(`CREATE TABLE IF NOT EXISTS public.tontine_members (
             id SERIAL PRIMARY KEY, tontine_id INTEGER REFERENCES public.tontines(id),
             user_id INTEGER REFERENCES public.users(id),
+            caisse_fund_paid DECIMAL DEFAULT 0,
             joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(tontine_id, user_id)
         )`);
@@ -120,14 +126,50 @@ const initDb = async () => {
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )`);
         await db.query(`CREATE TABLE IF NOT EXISTS public.social_events (
-            id SERIAL PRIMARY KEY, event_type TEXT, description TEXT,
-            target_amount DECIMAL, collected DECIMAL DEFAULT 0,
+            id SERIAL PRIMARY KEY,
+            tontine_id INTEGER REFERENCES public.tontines(id),
+            event_type TEXT NOT NULL,
+            description TEXT,
+            beneficiary_name TEXT,
+            target_amount DECIMAL DEFAULT 0,
+            collected DECIMAL DEFAULT 0,
+            created_by INTEGER REFERENCES public.users(id),
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )`);
+        await db.query(`CREATE TABLE IF NOT EXISTS public.social_donations (
+            id SERIAL PRIMARY KEY,
+            event_id INTEGER REFERENCES public.social_events(id),
+            user_id INTEGER REFERENCES public.users(id),
+            amount DECIMAL,
+            donated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )`);
         await db.query(`CREATE TABLE IF NOT EXISTS public.loans (
             id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES public.users(id),
             amount DECIMAL, purpose TEXT, status TEXT DEFAULT 'pending',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )`);
+        // Classement des membres : qui reçoit quel mois/cycle
+        await db.query(`CREATE TABLE IF NOT EXISTS public.tontine_schedule (
+            id SERIAL PRIMARY KEY,
+            tontine_id INTEGER REFERENCES public.tontines(id),
+            user_id INTEGER REFERENCES public.users(id),
+            cycle_number INTEGER NOT NULL,
+            scheduled_month INTEGER,
+            scheduled_year INTEGER,
+            has_received BOOLEAN DEFAULT false,
+            received_at TIMESTAMP,
+            payout_amount DECIMAL DEFAULT 0,
+            UNIQUE(tontine_id, cycle_number)
+        )`);
+        // Historique des paiements groupés (cagnotte envoyée au bénéficiaire)
+        await db.query(`CREATE TABLE IF NOT EXISTS public.tontine_payouts (
+            id SERIAL PRIMARY KEY,
+            tontine_id INTEGER REFERENCES public.tontines(id),
+            beneficiary_id INTEGER REFERENCES public.users(id),
+            cycle_number INTEGER,
+            total_amount DECIMAL,
+            payout_method TEXT DEFAULT 'wallet',
+            paid_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )`);
         console.log("✅ Base de données prête.");
     } catch (err) {
@@ -327,12 +369,17 @@ app.get('/api/tontines', authenticate, async (req, res) => {
 
 // POST /api/tontines
 app.post('/api/tontines', authenticate, requireFields('name', 'admin_id', 'frequency', 'amount'), async (req, res) => {
-    const { name, admin_id, frequency, amount, commission_rate } = req.body;
+    const { name, admin_id, frequency, amount, commission_rate,
+            deadline_time, deadline_day, has_caisse_fund, caisse_fund_amount } = req.body;
     try {
         const result = await db.query(`
-            INSERT INTO public.tontines (name, admin_id, frequency, amount_to_pay, commission_rate, status)
-            VALUES ($1, $2, $3, $4, $5, 'active') RETURNING *
-        `, [name, admin_id, frequency, amount, commission_rate || 0]);
+            INSERT INTO public.tontines
+              (name, admin_id, frequency, amount_to_pay, commission_rate, status,
+               deadline_time, deadline_day, has_caisse_fund, caisse_fund_amount)
+            VALUES ($1, $2, $3, $4, $5, 'active', $6, $7, $8, $9) RETURNING *
+        `, [name, admin_id, frequency, amount, commission_rate || 0,
+            deadline_time || '23:59', deadline_day || 28,
+            has_caisse_fund || false, caisse_fund_amount || 0]);
 
         // Ajouter l'admin comme premier membre
         await db.query(
@@ -429,11 +476,355 @@ app.post('/api/payments/tontine', authenticate, requireFields('user_id', 'tontin
             "INSERT INTO public.transactions (user_id, amount, type, status, description) VALUES ($1,$2,'tontine_pay','completed','Cotisation tontine')",
             [user_id, amount]
         );
+        // Mise à jour du score de crédibilité
+        // +2 si paiement à temps, -5 si en retard (min 0, max 100)
+        if (is_late) {
+            await db.query(
+                "UPDATE public.users SET credibility_score = GREATEST(0, credibility_score - 5) WHERE id=$1",
+                [user_id]
+            );
+        } else {
+            await db.query(
+                "UPDATE public.users SET credibility_score = LEAST(100, credibility_score + 2) WHERE id=$1",
+                [user_id]
+            );
+        }
         await db.query('COMMIT');
         res.json({ message: "Paiement effectué" });
     } catch (err) {
         await db.query('ROLLBACK');
         res.status(500).json({ message: "Erreur paiement" });
+    }
+});
+
+// POST /api/payments/caisse  (paiement fond de caisse)
+app.post('/api/payments/caisse', authenticate, requireFields('user_id', 'tontine_id', 'amount'), async (req, res) => {
+    const { user_id, tontine_id, amount } = req.body;
+    try {
+        await db.query('BEGIN');
+        const userResult = await db.query("SELECT balance FROM public.users WHERE id=$1", [user_id]);
+        if (userResult.rows.length === 0 || userResult.rows[0].balance < amount) {
+            await db.query('ROLLBACK');
+            return res.status(400).json({ message: "Solde insuffisant" });
+        }
+        await db.query("UPDATE public.users SET balance = balance - $1 WHERE id=$2", [amount, user_id]);
+        await db.query(
+            "UPDATE public.tontine_members SET caisse_fund_paid = caisse_fund_paid + $1 WHERE tontine_id=$2 AND user_id=$3",
+            [amount, tontine_id, user_id]
+        );
+        await db.query(
+            "INSERT INTO public.transactions (user_id, amount, type, status, description) VALUES ($1,$2,'caisse_fund','completed','Fond de caisse tontine')",
+            [user_id, amount]
+        );
+        await db.query('COMMIT');
+        res.json({ message: "Fond de caisse payé" });
+    } catch (err) {
+        await db.query('ROLLBACK');
+        res.status(500).json({ message: "Erreur paiement fond de caisse" });
+    }
+});
+
+// POST /api/tontines/:id/auto-debit  (débit automatique des membres en retard)
+app.post('/api/tontines/:id/auto-debit', authenticate, async (req, res) => {
+    const tontineId = req.params.id;
+    try {
+        const tontineResult = await db.query("SELECT * FROM public.tontines WHERE id=$1", [tontineId]);
+        if (!tontineResult.rows.length) return res.status(404).json({ message: "Tontine non trouvée" });
+        const tontine = tontineResult.rows[0];
+
+        if (req.user.id !== tontine.admin_id) {
+            return res.status(403).json({ message: "Seul l'admin peut déclencher le débit automatique" });
+        }
+
+        const baseAmount = parseFloat(tontine.amount_to_pay);
+        const penalty = 500;
+        const totalToPay = baseAmount + penalty;
+
+        const membersResult = await db.query(`
+            SELECT tm.user_id, u.fullname, u.balance
+            FROM public.tontine_members tm
+            JOIN public.users u ON u.id = tm.user_id
+            WHERE tm.tontine_id = $1
+            AND tm.user_id NOT IN (
+                SELECT user_id FROM public.tontine_payments
+                WHERE tontine_id = $1
+                AND paid_at >= date_trunc('month', NOW())
+            )
+        `, [tontineId]);
+
+        const debited = [];
+        const failed = [];
+
+        for (const member of membersResult.rows) {
+            if (parseFloat(member.balance) >= totalToPay) {
+                try {
+                    await db.query('BEGIN');
+                    await db.query("UPDATE public.users SET balance = balance - $1 WHERE id=$2", [totalToPay, member.user_id]);
+                    await db.query(
+                        "INSERT INTO public.tontine_payments (tontine_id, user_id, amount, is_late) VALUES ($1,$2,$3,true)",
+                        [tontineId, member.user_id, totalToPay]
+                    );
+                    await db.query(
+                        "INSERT INTO public.transactions (user_id, amount, type, status, description) VALUES ($1,$2,'tontine_pay','completed','Cotisation + amende (débit auto)')",
+                        [member.user_id, totalToPay]
+                    );
+                    await db.query(
+                        "UPDATE public.users SET credibility_score = GREATEST(0, credibility_score - 5) WHERE id=$1",
+                        [member.user_id]
+                    );
+                    await db.query('COMMIT');
+                    debited.push(member.fullname);
+                } catch (e) {
+                    await db.query('ROLLBACK').catch(() => {});
+                    failed.push(member.fullname);
+                }
+            } else {
+                failed.push(`${member.fullname} (solde insuffisant)`);
+            }
+        }
+
+        res.json({ message: "Débit automatique effectué", debited, failed,
+            total_debited: debited.length, total_failed: failed.length });
+    } catch (err) {
+        console.error("Erreur auto-débit:", err.message);
+        res.status(500).json({ message: "Erreur auto-débit" });
+    }
+});
+
+// GET /api/tontines/:id/member-status/:userId
+app.get('/api/tontines/:id/member-status/:userId', authenticate, async (req, res) => {
+    const { id: tontineId, userId } = req.params;
+    try {
+        const tontineResult = await db.query("SELECT * FROM public.tontines WHERE id=$1", [tontineId]);
+        if (!tontineResult.rows.length) return res.status(404).json({ message: "Tontine non trouvée" });
+        const t = tontineResult.rows[0];
+
+        const cotisationPaid = await db.query(`
+            SELECT COUNT(*) as count FROM public.tontine_payments
+            WHERE tontine_id=$1 AND user_id=$2
+            AND paid_at >= date_trunc('month', NOW())
+        `, [tontineId, userId]);
+
+        const caissePaid = await db.query(
+            "SELECT COALESCE(caisse_fund_paid, 0) as paid FROM public.tontine_members WHERE tontine_id=$1 AND user_id=$2",
+            [tontineId, userId]
+        );
+
+        const hasPaidCotisation = parseInt(cotisationPaid.rows[0].count) > 0;
+        const caisseFundPaid = parseFloat(caissePaid.rows[0]?.paid || 0);
+        const caisseFundRequired = parseFloat(t.caisse_fund_amount || 0);
+        const hasCaisseFund = t.has_caisse_fund;
+        const isCaisseComplete = !hasCaisseFund || caisseFundPaid >= caisseFundRequired;
+        const isRegular = hasPaidCotisation && isCaisseComplete;
+
+        res.json({
+            has_paid_cotisation: hasPaidCotisation,
+            caisse_fund_paid: caisseFundPaid,
+            caisse_fund_required: caisseFundRequired,
+            has_caisse_fund: hasCaisseFund,
+            is_caisse_complete: isCaisseComplete,
+            is_regular: isRegular,
+            can_borrow: isRegular,
+            deadline_time: t.deadline_time,
+            deadline_day: t.deadline_day,
+        });
+    } catch (err) {
+        res.status(500).json({ message: "Erreur serveur" });
+    }
+});
+
+// ==========================================
+// CLASSEMENT & CAGNOTTE
+// ==========================================
+
+// GET /api/tontines/:id/schedule  (classement des membres)
+app.get('/api/tontines/:id/schedule', authenticate, async (req, res) => {
+    try {
+        const result = await db.query(`
+            SELECT ts.*, u.fullname, u.phone,
+                (SELECT COALESCE(SUM(tp.amount),0)
+                 FROM public.tontine_payments tp
+                 WHERE tp.tontine_id = ts.tontine_id
+                 AND tp.paid_at >= date_trunc('month',
+                     make_date(ts.scheduled_year, ts.scheduled_month, 1))
+                 AND tp.paid_at < date_trunc('month',
+                     make_date(ts.scheduled_year, ts.scheduled_month, 1)) + interval '1 month'
+                ) as collected_this_cycle
+            FROM public.tontine_schedule ts
+            JOIN public.users u ON u.id = ts.user_id
+            WHERE ts.tontine_id = $1
+            ORDER BY ts.cycle_number ASC
+        `, [req.params.id]);
+        res.json(result.rows);
+    } catch (err) {
+        res.status(500).json({ message: "Erreur serveur" });
+    }
+});
+
+// POST /api/tontines/:id/schedule  (générer ou mettre à jour le classement)
+app.post('/api/tontines/:id/schedule', authenticate, async (req, res) => {
+    const tontineId = req.params.id;
+    try {
+        const tontine = await db.query("SELECT * FROM public.tontines WHERE id=$1", [tontineId]);
+        if (!tontine.rows.length) return res.status(404).json({ message: "Tontine non trouvée" });
+        if (req.user.id !== tontine.rows[0].admin_id) {
+            return res.status(403).json({ message: "Seul l'admin peut gérer le classement" });
+        }
+
+        const members = await db.query(
+            "SELECT user_id FROM public.tontine_members WHERE tontine_id=$1 ORDER BY joined_at ASC",
+            [tontineId]
+        );
+
+        const now = new Date();
+        let month = now.getMonth() + 1;
+        let year  = now.getFullYear();
+
+        // Supprimer l'ancien classement non reçu
+        await db.query(
+            "DELETE FROM public.tontine_schedule WHERE tontine_id=$1 AND has_received=false",
+            [tontineId]
+        );
+
+        const inserted = [];
+        for (let i = 0; i < members.rows.length; i++) {
+            const cycleMonth = ((month - 1 + i) % 12) + 1;
+            const cycleYear  = year + Math.floor((month - 1 + i) / 12);
+            const cycleNum   = i + 1;
+
+            // Ne pas écraser si déjà reçu
+            const existing = await db.query(
+                "SELECT id FROM public.tontine_schedule WHERE tontine_id=$1 AND user_id=$2",
+                [tontineId, members.rows[i].user_id]
+            );
+            if (existing.rows.length === 0) {
+                await db.query(`
+                    INSERT INTO public.tontine_schedule
+                      (tontine_id, user_id, cycle_number, scheduled_month, scheduled_year)
+                    VALUES ($1,$2,$3,$4,$5)
+                    ON CONFLICT (tontine_id, cycle_number) DO NOTHING
+                `, [tontineId, members.rows[i].user_id, cycleNum, cycleMonth, cycleYear]);
+                inserted.push(members.rows[i].user_id);
+            }
+        }
+        res.json({ message: "Classement généré", count: inserted.length });
+    } catch (err) {
+        console.error("Erreur classement:", err.message);
+        res.status(500).json({ message: "Erreur serveur" });
+    }
+});
+
+// GET /api/tontines/:id/cagnotte  (total des cotisations du cycle actuel)
+app.get('/api/tontines/:id/cagnotte', authenticate, async (req, res) => {
+    try {
+        const result = await db.query(`
+            SELECT
+                COALESCE(SUM(tp.amount), 0) as total_collected,
+                COUNT(DISTINCT tp.user_id) as payers_count,
+                (SELECT COUNT(*) FROM public.tontine_members WHERE tontine_id=$1) as total_members,
+                (SELECT amount_to_pay FROM public.tontines WHERE id=$1) as amount_per_member
+            FROM public.tontine_payments tp
+            WHERE tp.tontine_id = $1
+            AND tp.paid_at >= date_trunc('month', NOW())
+        `, [req.params.id]);
+        res.json(result.rows[0]);
+    } catch (err) {
+        res.status(500).json({ message: "Erreur serveur" });
+    }
+});
+
+// POST /api/tontines/:id/payout  (envoyer la cagnotte au bénéficiaire)
+app.post('/api/tontines/:id/payout', authenticate, requireFields('beneficiary_id', 'payout_method'), async (req, res) => {
+    const tontineId = req.params.id;
+    const { beneficiary_id, payout_method } = req.body;
+    try {
+        const tontine = await db.query("SELECT * FROM public.tontines WHERE id=$1", [tontineId]);
+        if (!tontine.rows.length) return res.status(404).json({ message: "Tontine non trouvée" });
+        if (req.user.id !== tontine.rows[0].admin_id) {
+            return res.status(403).json({ message: "Seul l'admin peut envoyer la cagnotte" });
+        }
+
+        // Calculer le total du cycle actuel
+        const cagnotte = await db.query(`
+            SELECT COALESCE(SUM(amount), 0) as total
+            FROM public.tontine_payments
+            WHERE tontine_id=$1 AND paid_at >= date_trunc('month', NOW())
+        `, [tontineId]);
+
+        const total = parseFloat(cagnotte.rows[0].total);
+        if (total <= 0) return res.status(400).json({ message: "Aucune cotisation collectée ce mois" });
+
+        await db.query('BEGIN');
+
+        // Créditer le bénéficiaire si paiement interne
+        if (payout_method === 'wallet') {
+            await db.query("UPDATE public.users SET balance = balance + $1 WHERE id=$2", [total, beneficiary_id]);
+        }
+
+        // Enregistrer le paiement
+        const cycleResult = await db.query(
+            "SELECT COALESCE(MAX(cycle_number),0)+1 as next FROM public.tontine_payouts WHERE tontine_id=$1",
+            [tontineId]
+        );
+        const cycleNum = cycleResult.rows[0].next;
+
+        await db.query(`
+            INSERT INTO public.tontine_payouts (tontine_id, beneficiary_id, cycle_number, total_amount, payout_method)
+            VALUES ($1,$2,$3,$4,$5)
+        `, [tontineId, beneficiary_id, cycleNum, total, payout_method]);
+
+        // Marquer le bénéficiaire comme ayant reçu
+        await db.query(`
+            UPDATE public.tontine_schedule
+            SET has_received=true, received_at=NOW(), payout_amount=$1
+            WHERE tontine_id=$2 AND user_id=$3 AND has_received=false
+        `, [total, tontineId, beneficiary_id]);
+
+        // Transaction pour le bénéficiaire
+        await db.query(`
+            INSERT INTO public.transactions (user_id, amount, type, status, description)
+            VALUES ($1,$2,'tontine_payout','completed','Cagnotte tontine reçue')
+        `, [beneficiary_id, total]);
+
+        await db.query('COMMIT');
+        res.json({ message: "Cagnotte envoyée avec succès", total, beneficiary_id, payout_method });
+    } catch (err) {
+        await db.query('ROLLBACK').catch(() => {});
+        console.error("Erreur payout:", err.message);
+        res.status(500).json({ message: "Erreur envoi cagnotte" });
+    }
+});
+
+// POST /api/tontines/:id/whatsapp-reminder  (envoyer rappels WhatsApp)
+app.post('/api/tontines/:id/whatsapp-reminder', authenticate, async (req, res) => {
+    const tontineId = req.params.id;
+    try {
+        const tontine = await db.query("SELECT * FROM public.tontines WHERE id=$1", [tontineId]);
+        if (!tontine.rows.length) return res.status(404).json({ message: "Tontine non trouvée" });
+        const t = tontine.rows[0];
+
+        // Membres qui n'ont pas encore payé ce mois
+        const unpaid = await db.query(`
+            SELECT u.fullname, u.phone
+            FROM public.tontine_members tm
+            JOIN public.users u ON u.id = tm.user_id
+            WHERE tm.tontine_id = $1
+            AND tm.user_id NOT IN (
+                SELECT user_id FROM public.tontine_payments
+                WHERE tontine_id=$1 AND paid_at >= date_trunc('month', NOW())
+            )
+        `, [tontineId]);
+
+        const messages = unpaid.rows.map(m => ({
+            phone: m.phone,
+            fullname: m.fullname,
+            message: `Bonjour ${m.fullname} 👋\n\nRappel : La cotisation de la tontine *${t.name}* est due avant le *${t.deadline_day} du mois à ${t.deadline_time}*.\n\nMontant : *${t.amount_to_pay} FCFA*\n\nMerci de payer à temps pour éviter l'amende de 500 F. 🙏\n\n_G-Caisse_`,
+            whatsapp_url: `https://wa.me/237${m.phone.replace(/^0/, '')}?text=${encodeURIComponent(`Bonjour ${m.fullname}, rappel cotisation tontine ${t.name} : ${t.amount_to_pay} FCFA avant le ${t.deadline_day} à ${t.deadline_time}. Merci !`)}`
+        }));
+
+        res.json({ message: "Rappels préparés", count: messages.length, reminders: messages });
+    } catch (err) {
+        res.status(500).json({ message: "Erreur serveur" });
     }
 });
 
@@ -515,13 +906,42 @@ app.post('/api/deposit', authenticate, requireFields('amount', 'user_id', 'name'
     const reference = `DEP_${user_id}_${Date.now()}`;
     try {
         const response = await axios.post('https://api.notchpay.co/payments', {
-            amount, currency: 'XAF', reference,
+            amount,
+            currency: 'XAF',
+            reference,
             callback: process.env.PAYMENT_CALLBACK_URL,
-            customer: { name, email: email || `user${user_id}@g-caisse.com`, phone }
-        }, { headers: { 'Authorization': process.env.NOTCH_PUBLIC_KEY, 'Content-Type': 'application/json' } });
-        res.json({ success: true, payment_url: response.data.authorization_url });
+            customer: {
+                name,
+                email: email || `user${user_id}@g-caisse.com`,
+                phone
+            }
+        }, {
+            headers: {
+                'Authorization': process.env.NOTCH_PUBLIC_KEY,
+                'Content-Type': 'application/json',
+                'Accept': 'application/json'
+            }
+        });
+
+        // Notch Pay retourne l'URL dans transaction.payment_url ou authorization_url selon la version
+        const data = response.data;
+        const paymentUrl = data?.transaction?.payment_url
+            || data?.authorization_url
+            || data?.payment_url;
+
+        if (!paymentUrl) {
+            console.error('[NOTCH] Réponse inattendue:', JSON.stringify(data));
+            return res.status(400).json({ error: "URL de paiement non reçue", details: data });
+        }
+
+        res.json({ success: true, payment_url: paymentUrl });
     } catch (err) {
-        res.status(400).json({ error: "Erreur Notch Pay", details: err.message });
+        const errData = err.response?.data;
+        console.error('[NOTCH DEPOSIT ERROR]', errData || err.message);
+        res.status(400).json({
+            error: "Erreur Notch Pay",
+            details: errData?.message || errData?.error || err.message
+        });
     }
 });
 
@@ -683,33 +1103,93 @@ app.post('/api/loans/islamic', authenticate, requireFields('user_id', 'amount', 
     }
 });
 
-// GET /api/social/fund
+// GET /api/social/fund  (fonds global toutes tontines)
 app.get('/api/social/fund', authenticate, async (req, res) => {
     try {
-        const result = await db.query("SELECT COALESCE(SUM(amount),0) as total FROM public.transactions WHERE type='social_donation'");
+        const result = await db.query("SELECT COALESCE(SUM(collected),0) as total FROM public.social_events");
         res.json({ total: result.rows[0].total });
     } catch (err) {
         res.status(500).json({ message: "Erreur serveur" });
     }
 });
 
-// GET /api/social/events
+// GET /api/social/events  (tous les événements)
 app.get('/api/social/events', authenticate, async (req, res) => {
     try {
-        const result = await db.query("SELECT * FROM public.social_events ORDER BY created_at DESC");
+        const result = await db.query(`
+            SELECT se.*, u.fullname as creator_name
+            FROM public.social_events se
+            LEFT JOIN public.users u ON u.id = se.created_by
+            ORDER BY se.created_at DESC
+        `);
         res.json(result.rows);
     } catch (err) {
         res.status(500).json({ message: "Erreur serveur" });
     }
 });
 
-// POST /api/social/donate
-app.post('/api/social/donate', authenticate, requireFields('event_id', 'amount'), async (req, res) => {
-    const { event_id, amount } = req.body;
+// GET /api/tontines/:id/social/events  (événements d'une tontine)
+app.get('/api/tontines/:id/social/events', authenticate, async (req, res) => {
     try {
+        const result = await db.query(`
+            SELECT se.*, u.fullname as creator_name,
+                (SELECT COALESCE(SUM(sd.amount),0) FROM public.social_donations sd WHERE sd.event_id = se.id) as collected
+            FROM public.social_events se
+            LEFT JOIN public.users u ON u.id = se.created_by
+            WHERE se.tontine_id = $1
+            ORDER BY se.created_at DESC
+        `, [req.params.id]);
+        res.json(result.rows);
+    } catch (err) {
+        res.status(500).json({ message: "Erreur serveur" });
+    }
+});
+
+// POST /api/tontines/:id/social/events  (créer un événement dans une tontine)
+app.post('/api/tontines/:id/social/events', authenticate,
+    requireFields('event_type', 'description', 'target_amount', 'created_by'), async (req, res) => {
+    const { event_type, description, target_amount, created_by, beneficiary_name } = req.body;
+    try {
+        const result = await db.query(`
+            INSERT INTO public.social_events (tontine_id, event_type, description, target_amount, beneficiary_name, created_by)
+            VALUES ($1, $2, $3, $4, $5, $6) RETURNING *
+        `, [req.params.id, event_type, description, target_amount, beneficiary_name || '', created_by]);
+        res.status(201).json(result.rows[0]);
+    } catch (err) {
+        console.error("Erreur création événement social:", err.message);
+        res.status(500).json({ message: "Erreur serveur" });
+    }
+});
+
+// POST /api/social/donate  (faire un don à un événement)
+app.post('/api/social/donate', authenticate, requireFields('event_id', 'amount', 'user_id'), async (req, res) => {
+    const { event_id, amount, user_id } = req.body;
+    try {
+        await db.query('BEGIN');
+        // Vérifier le solde
+        const userResult = await db.query("SELECT balance FROM public.users WHERE id=$1", [user_id]);
+        if (!userResult.rows.length || userResult.rows[0].balance < amount) {
+            await db.query('ROLLBACK');
+            return res.status(400).json({ message: "Solde insuffisant" });
+        }
+        // Débiter le donateur
+        await db.query("UPDATE public.users SET balance = balance - $1 WHERE id=$2", [amount, user_id]);
+        // Enregistrer le don
+        await db.query(
+            "INSERT INTO public.social_donations (event_id, user_id, amount) VALUES ($1,$2,$3)",
+            [event_id, user_id, amount]
+        );
+        // Mettre à jour le total collecté
         await db.query("UPDATE public.social_events SET collected = collected + $1 WHERE id=$2", [amount, event_id]);
+        // Transaction
+        await db.query(
+            "INSERT INTO public.transactions (user_id, amount, type, status, description) VALUES ($1,$2,'social_donation','completed','Don solidarité')",
+            [user_id, amount]
+        );
+        await db.query('COMMIT');
         res.json({ message: "Don enregistré" });
     } catch (err) {
+        await db.query('ROLLBACK').catch(() => {});
         res.status(500).json({ message: "Erreur serveur" });
     }
 });
