@@ -388,8 +388,13 @@ app.post('/api/tontines', authenticate, requireFields('name', 'admin_id', 'frequ
         );
         res.status(201).json(result.rows[0]);
     } catch (err) {
-        console.error("Erreur création tontine:", err.message);
-        res.status(500).json({ message: "Échec de la création" });
+        console.error("Erreur création tontine:", err.message, err.detail, err.code);
+        res.status(500).json({
+            message: "Échec de la création",
+            error: err.message,
+            detail: err.detail,
+            code: err.code
+        });
     }
 });
 
@@ -905,6 +910,10 @@ app.post('/api/deposit', authenticate, requireFields('amount', 'user_id', 'name'
     const { amount, user_id, name, email, phone } = req.body;
     const reference = `DEP_${user_id}_${Date.now()}`;
     try {
+        if (!process.env.NOTCH_PRIVATE_KEY) {
+            console.error('[NOTCH] NOTCH_PRIVATE_KEY non configuré dans les variables d\'environnement');
+            return res.status(500).json({ error: "Configuration paiement manquante", details: "NOTCH_PRIVATE_KEY non défini sur le serveur" });
+        }
         const response = await axios.post('https://api.notchpay.co/payments', {
             amount,
             currency: 'XAF',
@@ -917,7 +926,7 @@ app.post('/api/deposit', authenticate, requireFields('amount', 'user_id', 'name'
             }
         }, {
             headers: {
-                'Authorization': process.env.NOTCH_PUBLIC_KEY,
+                'Authorization': `Bearer ${process.env.NOTCH_PRIVATE_KEY}`,
                 'Content-Type': 'application/json',
                 'Accept': 'application/json'
             }
@@ -937,10 +946,17 @@ app.post('/api/deposit', authenticate, requireFields('amount', 'user_id', 'name'
         res.json({ success: true, payment_url: paymentUrl });
     } catch (err) {
         const errData = err.response?.data;
-        console.error('[NOTCH DEPOSIT ERROR]', errData || err.message);
+        console.error('[NOTCH DEPOSIT ERROR]', {
+            status: err.response?.status,
+            statusText: err.response?.statusText,
+            data: errData,
+            message: err.message,
+            headers: err.response?.headers
+        });
         res.status(400).json({
             error: "Erreur Notch Pay",
-            details: errData?.message || errData?.error || err.message
+            details: errData?.message || errData?.error || err.message,
+            status: err.response?.status
         });
     }
 });
@@ -953,11 +969,14 @@ app.post('/api/payout', authenticate, requireFields('user_id', 'amount', 'phone'
         if (userResult.rows.length === 0 || userResult.rows[0].balance < amount) {
             return res.status(400).json({ message: "Solde insuffisant" });
         }
+        if (!process.env.NOTCH_PRIVATE_KEY) {
+            return res.status(500).json({ message: "Configuration paiement manquante" });
+        }
         const reference = `PAY_${user_id}_${Date.now()}`;
         const response = await axios.post('https://api.notchpay.co/transfers', {
             amount, currency: 'XAF', reference,
             destination: { channel: channel || 'cm.mobile', number: phone, name }
-        }, { headers: { 'Authorization': process.env.NOTCH_PUBLIC_KEY, 'Content-Type': 'application/json' } });
+        }, { headers: { 'Authorization': `Bearer ${process.env.NOTCH_PRIVATE_KEY}`, 'Content-Type': 'application/json' } });
 
         await db.query('BEGIN');
         await db.query("UPDATE public.users SET balance = balance - $1 WHERE id=$2", [amount, user_id]);
