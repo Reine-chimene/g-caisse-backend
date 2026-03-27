@@ -171,6 +171,13 @@ const initDb = async () => {
             payout_method TEXT DEFAULT 'wallet',
             paid_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )`);
+        // Ajouter les colonnes manquantes si la table existe déjà
+        await db.query(`ALTER TABLE public.tontines ADD COLUMN IF NOT EXISTS deadline_time TEXT DEFAULT '23:59'`);
+        await db.query(`ALTER TABLE public.tontines ADD COLUMN IF NOT EXISTS deadline_day INTEGER DEFAULT 28`);
+        await db.query(`ALTER TABLE public.tontines ADD COLUMN IF NOT EXISTS has_caisse_fund BOOLEAN DEFAULT false`);
+        await db.query(`ALTER TABLE public.tontines ADD COLUMN IF NOT EXISTS caisse_fund_amount DECIMAL DEFAULT 0`);
+        // Colonnes manquantes dans tontine_members
+        await db.query(`ALTER TABLE public.tontine_members ADD COLUMN IF NOT EXISTS caisse_fund_paid DECIMAL DEFAULT 0`);
         console.log("✅ Base de données prête.");
     } catch (err) {
         console.error("❌ Erreur DB:", err.message);
