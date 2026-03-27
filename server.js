@@ -917,9 +917,9 @@ app.post('/api/deposit', authenticate, requireFields('amount', 'user_id', 'name'
     const { amount, user_id, name, email, phone } = req.body;
     const reference = `DEP_${user_id}_${Date.now()}`;
     try {
-        if (!process.env.NOTCH_PRIVATE_KEY) {
-            console.error('[NOTCH] NOTCH_PRIVATE_KEY non configuré dans les variables d\'environnement');
-            return res.status(500).json({ error: "Configuration paiement manquante", details: "NOTCH_PRIVATE_KEY non défini sur le serveur" });
+        if (!process.env.NOTCH_PUBLIC_KEY) {
+            console.error('[NOTCH] NOTCH_PUBLIC_KEY non configuré dans les variables d\'environnement');
+            return res.status(500).json({ error: "Configuration paiement manquante", details: "NOTCH_PUBLIC_KEY non défini sur le serveur" });
         }
         const response = await axios.post('https://api.notchpay.co/payments', {
             amount,
@@ -933,7 +933,7 @@ app.post('/api/deposit', authenticate, requireFields('amount', 'user_id', 'name'
             }
         }, {
             headers: {
-                'Authorization': `Bearer ${process.env.NOTCH_PRIVATE_KEY}`,
+                'Authorization': process.env.NOTCH_PUBLIC_KEY,
                 'Content-Type': 'application/json',
                 'Accept': 'application/json'
             }
@@ -983,7 +983,7 @@ app.post('/api/payout', authenticate, requireFields('user_id', 'amount', 'phone'
         const response = await axios.post('https://api.notchpay.co/transfers', {
             amount, currency: 'XAF', reference,
             destination: { channel: channel || 'cm.mobile', number: phone, name }
-        }, { headers: { 'Authorization': `Bearer ${process.env.NOTCH_PRIVATE_KEY}`, 'Content-Type': 'application/json' } });
+        }, { headers: { 'Authorization': process.env.NOTCH_PUBLIC_KEY, 'X-Grant': process.env.NOTCH_PRIVATE_KEY, 'Content-Type': 'application/json' } });
 
         await db.query('BEGIN');
         await db.query("UPDATE public.users SET balance = balance - $1 WHERE id=$2", [amount, user_id]);
