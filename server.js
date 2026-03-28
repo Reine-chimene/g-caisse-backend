@@ -182,6 +182,19 @@ const initDb = async () => {
             net_amount DECIMAL NOT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )`);
+        // Transferts en attente (OM↔MoMo, recharge, factures)
+        await db.query(`CREATE TABLE IF NOT EXISTS public.pending_transfers (
+            id SERIAL PRIMARY KEY,
+            sender_id INTEGER REFERENCES public.users(id),
+            sender_phone TEXT NOT NULL,
+            sender_operator TEXT NOT NULL,
+            receiver_phone TEXT NOT NULL,
+            receiver_operator TEXT NOT NULL,
+            amount DECIMAL NOT NULL,
+            payment_reference TEXT UNIQUE NOT NULL,
+            status TEXT DEFAULT 'pending',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )`);
         // Dépôts par virement bancaire
         await db.query(`CREATE TABLE IF NOT EXISTS public.bank_deposits (
             id SERIAL PRIMARY KEY,
