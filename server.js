@@ -171,6 +171,31 @@ const initDb = async () => {
             payout_method TEXT DEFAULT 'wallet',
             paid_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )`);
+        // Commissions de la plateforme (2% prélevés lors du payout)
+        await db.query(`CREATE TABLE IF NOT EXISTS public.platform_commissions (
+            id SERIAL PRIMARY KEY,
+            tontine_id INTEGER REFERENCES public.tontines(id),
+            payout_id INTEGER REFERENCES public.tontine_payouts(id),
+            gross_amount DECIMAL NOT NULL,
+            commission_rate DECIMAL NOT NULL,
+            commission_amount DECIMAL NOT NULL,
+            net_amount DECIMAL NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )`);
+        // Dépôts par virement bancaire
+        await db.query(`CREATE TABLE IF NOT EXISTS public.bank_deposits (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER REFERENCES public.users(id),
+            amount DECIMAL NOT NULL,
+            reference TEXT UNIQUE NOT NULL,
+            bank_name TEXT,
+            sender_name TEXT,
+            status TEXT DEFAULT 'pending',
+            admin_note TEXT,
+            validated_by INTEGER REFERENCES public.users(id),
+            validated_at TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )`);
         // Ajouter les colonnes manquantes si la table existe déjà
         await db.query(`ALTER TABLE public.tontines ADD COLUMN IF NOT EXISTS deadline_time TEXT DEFAULT '23:59'`);
         await db.query(`ALTER TABLE public.tontines ADD COLUMN IF NOT EXISTS deadline_day INTEGER DEFAULT 28`);
@@ -178,6 +203,32 @@ const initDb = async () => {
         await db.query(`ALTER TABLE public.tontines ADD COLUMN IF NOT EXISTS caisse_fund_amount DECIMAL DEFAULT 0`);
         // Colonnes manquantes dans tontine_members
         await db.query(`ALTER TABLE public.tontine_members ADD COLUMN IF NOT EXISTS caisse_fund_paid DECIMAL DEFAULT 0`);
+        // Corriger la contrainte frequency pour accepter toutes les valeurs de l'app
+        await db.query("ALTER TABLE public.tontines DROP CONSTRAINT IF EXISTS tontines_frequency_check");
+        await db.query("ALTER TABLE public.tontines ADD CONSTRAINT tontines_frequency_check CHECK (frequency::text = ANY(ARRAY['journalier','hebdo','mensuel','quinzaine','express']::text[]))");
+
+        // === PARRAINAGE ===
+        await db.query(`ALTER TABLE public.users ADD COLUMN IF NOT EXISTS referral_code TEXT`);
+        await db.query(`ALTER TABLE public.users ADD COLUMN IF NOT EXISTS referred_by INTEGER`);
+        await db.query(`CREATE TABLE IF NOT EXISTS public.referrals (
+            id SERIAL PRIMARY KEY,
+            referrer_id INTEGER REFERENCES public.users(id),
+            referred_id INTEGER REFERENCES public.users(id),
+            bonus_amount DECIMAL DEFAULT 500,
+            status TEXT DEFAULT 'pending',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )`);
+
+        // === PREUVE VIDÉO ===
+        await db.query(`ALTER TABLE public.tontine_payouts ADD COLUMN IF NOT EXISTS proof_video_url TEXT`);
+
+        // Générer les codes de parrainage manquants
+        const usersWithoutCode = await db.query("SELECT id FROM public.users WHERE referral_code IS NULL");
+        for (const u of usersWithoutCode.rows) {
+            const code = 'GC' + u.id.toString().padStart(5, '0');
+            await db.query("UPDATE public.users SET referral_code=$1 WHERE id=$2", [code, u.id]);
+        }
+
         console.log("✅ Base de données prête.");
     } catch (err) {
         console.error("❌ Erreur DB:", err.message);
@@ -198,14 +249,38 @@ app.get('/', (req, res) => {
 
 // POST /api/users  (inscription — appelé par registerUser dans api_service)
 app.post('/api/users', requireFields('fullname', 'phone', 'pincode'), async (req, res) => {
-    const { fullname, phone, pincode } = req.body;
+    const { fullname, phone, pincode, referral_code } = req.body;
     try {
         const pincode_hash = await bcrypt.hash(String(pincode), SALT_ROUNDS);
+
+        // Vérifier le code de parrainage
+        let referrerId = null;
+        if (referral_code) {
+            const referrer = await db.query("SELECT id FROM public.users WHERE referral_code=$1", [referral_code.toUpperCase()]);
+            if (referrer.rows.length > 0) referrerId = referrer.rows[0].id;
+        }
+
         const result = await db.query(
-            "INSERT INTO public.users (fullname, phone, pincode_hash) VALUES ($1, $2, $3) RETURNING id, fullname, phone",
-            [fullname, phone, pincode_hash]
+            "INSERT INTO public.users (fullname, phone, pincode_hash, referred_by) VALUES ($1, $2, $3, $4) RETURNING id, fullname, phone",
+            [fullname, phone, pincode_hash, referrerId]
         );
-        res.status(201).json(result.rows[0]);
+        const userId = result.rows[0].id;
+
+        // Générer le code de parrainage unique
+        const myReferralCode = 'GC' + userId.toString().padStart(5, '0');
+        await db.query("UPDATE public.users SET referral_code=$1 WHERE id=$2", [myReferralCode, userId]);
+
+        // Enregistrer le parrainage et créditer le bonus
+        if (referrerId) {
+            await db.query("INSERT INTO public.referrals (referrer_id, referred_id, status) VALUES ($1,$2,'completed')", [referrerId, userId]);
+            await db.query("UPDATE public.users SET balance = balance + 500 WHERE id=$1", [referrerId]);
+            await db.query(
+                "INSERT INTO public.transactions (user_id, amount, type, status, description) VALUES ($1,500,'referral_bonus','completed','Bonus parrainage')",
+                [referrerId]
+            );
+        }
+
+        res.status(201).json({ ...result.rows[0], referral_code: myReferralCode });
     } catch (err) {
         if (err.code === '23505') return res.status(409).json({ message: "Ce numéro est déjà enregistré" });
         res.status(500).json({ message: "Erreur lors de l'inscription" });
@@ -379,6 +454,11 @@ app.post('/api/tontines', authenticate, requireFields('name', 'admin_id', 'frequ
     const { name, admin_id, frequency, amount, commission_rate,
             deadline_time, deadline_day, has_caisse_fund, caisse_fund_amount } = req.body;
     try {
+        // Vérifier que l'utilisateur existe
+        const userCheck = await db.query("SELECT id FROM public.users WHERE id=$1", [admin_id]);
+        if (userCheck.rows.length === 0) {
+            return res.status(400).json({ message: "Utilisateur invalide", error: `admin_id ${admin_id} non trouvé` });
+        }
         const result = await db.query(`
             INSERT INTO public.tontines
               (name, admin_id, frequency, amount_to_pay, commission_rate, status,
@@ -766,11 +846,16 @@ app.post('/api/tontines/:id/payout', authenticate, requireFields('beneficiary_id
         const total = parseFloat(cagnotte.rows[0].total);
         if (total <= 0) return res.status(400).json({ message: "Aucune cotisation collectée ce mois" });
 
+        // Calcul de la commission plateforme
+        const commissionRate = parseFloat(tontine.rows[0].commission_rate) || 1;
+        const commissionAmount = Math.round(total * commissionRate / 100);
+        const netAmount = total - commissionAmount;
+
         await db.query('BEGIN');
 
-        // Créditer le bénéficiaire si paiement interne
+        // Créditer le bénéficiaire avec le montant net (après commission)
         if (payout_method === 'wallet') {
-            await db.query("UPDATE public.users SET balance = balance + $1 WHERE id=$2", [total, beneficiary_id]);
+            await db.query("UPDATE public.users SET balance = balance + $1 WHERE id=$2", [netAmount, beneficiary_id]);
         }
 
         // Enregistrer le paiement
@@ -780,26 +865,32 @@ app.post('/api/tontines/:id/payout', authenticate, requireFields('beneficiary_id
         );
         const cycleNum = cycleResult.rows[0].next;
 
-        await db.query(`
+        const payoutResult = await db.query(`
             INSERT INTO public.tontine_payouts (tontine_id, beneficiary_id, cycle_number, total_amount, payout_method)
-            VALUES ($1,$2,$3,$4,$5)
-        `, [tontineId, beneficiary_id, cycleNum, total, payout_method]);
+            VALUES ($1,$2,$3,$4,$5) RETURNING id
+        `, [tontineId, beneficiary_id, cycleNum, netAmount, payout_method]);
+
+        // Enregistrer la commission
+        await db.query(`
+            INSERT INTO public.platform_commissions (tontine_id, payout_id, gross_amount, commission_rate, commission_amount, net_amount)
+            VALUES ($1,$2,$3,$4,$5,$6)
+        `, [tontineId, payoutResult.rows[0].id, total, commissionRate, commissionAmount, netAmount]);
 
         // Marquer le bénéficiaire comme ayant reçu
         await db.query(`
             UPDATE public.tontine_schedule
             SET has_received=true, received_at=NOW(), payout_amount=$1
             WHERE tontine_id=$2 AND user_id=$3 AND has_received=false
-        `, [total, tontineId, beneficiary_id]);
+        `, [netAmount, tontineId, beneficiary_id]);
 
         // Transaction pour le bénéficiaire
         await db.query(`
             INSERT INTO public.transactions (user_id, amount, type, status, description)
-            VALUES ($1,$2,'tontine_payout','completed','Cagnotte tontine reçue')
-        `, [beneficiary_id, total]);
+            VALUES ($1,$2,'tontine_payout','completed','Cagnotte tontine reçue (après commission ${commissionRate}%)')
+        `, [beneficiary_id, netAmount]);
 
         await db.query('COMMIT');
-        res.json({ message: "Cagnotte envoyée avec succès", total, beneficiary_id, payout_method });
+        res.json({ message: "Cagnotte envoyée avec succès", total: netAmount, gross: total, commission: commissionAmount, commission_rate: commissionRate, beneficiary_id, payout_method });
     } catch (err) {
         await db.query('ROLLBACK').catch(() => {});
         console.error("Erreur payout:", err.message);
@@ -999,28 +1090,57 @@ app.post('/api/payout', authenticate, requireFields('user_id', 'amount', 'phone'
     }
 });
 
-// POST /api/transfer (transfert interne entre utilisateurs)
+// POST /api/transfer (transfert interne ou via Mobile Money)
 app.post('/api/transfer', authenticate, requireFields('sender_id', 'receiver_phone', 'amount'), async (req, res) => {
-    const { sender_id, receiver_phone, amount } = req.body;
+    const { sender_id, receiver_phone, amount, operator } = req.body;
     try {
         await db.query('BEGIN');
-        const sender = await db.query("SELECT balance FROM public.users WHERE id=$1", [sender_id]);
+        const sender = await db.query("SELECT balance, fullname FROM public.users WHERE id=$1", [sender_id]);
         if (sender.rows.length === 0 || sender.rows[0].balance < amount) {
             await db.query('ROLLBACK');
             return res.status(400).json({ message: "Solde insuffisant" });
         }
-        const receiver = await db.query("SELECT id FROM public.users WHERE phone=$1", [receiver_phone]);
-        if (receiver.rows.length === 0) {
-            await db.query('ROLLBACK');
-            return res.status(404).json({ message: "Destinataire non trouvé" });
-        }
-        const receiverId = receiver.rows[0].id;
+
+        // Débit de l'expéditeur
         await db.query("UPDATE public.users SET balance = balance - $1 WHERE id=$2", [amount, sender_id]);
-        await db.query("UPDATE public.users SET balance = balance + $1 WHERE id=$2", [amount, receiverId]);
-        await db.query("INSERT INTO public.transactions (user_id, amount, type, status, description) VALUES ($1,$2,'transfer_out','completed','Transfert envoyé')", [sender_id, amount]);
-        await db.query("INSERT INTO public.transactions (user_id, amount, type, status, description) VALUES ($1,$2,'transfer_in','completed','Transfert reçu')", [receiverId, amount]);
-        await db.query('COMMIT');
-        res.json({ message: "Transfert effectué" });
+
+        if (operator && (operator === 'cm.orange' || operator === 'cm.mtn')) {
+            // Transfert réel via Notch Pay (Orange Money / MTN MoMo)
+            if (!process.env.NOTCH_PRIVATE_KEY) {
+                await db.query('ROLLBACK');
+                return res.status(500).json({ message: "Configuration paiement manquante" });
+            }
+            const reference = `XFER_${sender_id}_${Date.now()}`;
+            try {
+                const notchRes = await axios.post('https://api.notchpay.co/transfers', {
+                    amount, currency: 'XAF', reference,
+                    destination: { channel: operator, number: receiver_phone, name: sender.rows[0].fullname }
+                }, { headers: { 'Authorization': process.env.NOTCH_PUBLIC_KEY, 'X-Grant': process.env.NOTCH_PRIVATE_KEY, 'Content-Type': 'application/json' } });
+
+                await db.query("INSERT INTO public.transactions (user_id, amount, type, status, reference, description) VALUES ($1,$2,'transfer_out','completed',$3,$4)",
+                    [sender_id, amount, reference, `Transfert ${operator === 'cm.orange' ? 'OM' : 'MoMo'} vers ${receiver_phone}`]);
+                await db.query('COMMIT');
+                return res.json({ message: `Transfert ${operator === 'cm.orange' ? 'Orange Money' : 'MTN MoMo'} effectué`, data: notchRes.data });
+            } catch (notchErr) {
+                // Rembourser l'expéditeur si Notch Pay échoue
+                await db.query("UPDATE public.users SET balance = balance + $1 WHERE id=$2", [amount, sender_id]);
+                await db.query('ROLLBACK');
+                return res.status(400).json({ message: notchErr.response?.data?.message || "Échec transfert Mobile Money" });
+            }
+        } else {
+            // Transfert interne (balance à balance)
+            const receiver = await db.query("SELECT id FROM public.users WHERE phone=$1", [receiver_phone]);
+            if (receiver.rows.length === 0) {
+                await db.query('ROLLBACK');
+                return res.status(404).json({ message: "Destinataire non trouvé" });
+            }
+            const receiverId = receiver.rows[0].id;
+            await db.query("UPDATE public.users SET balance = balance + $1 WHERE id=$2", [amount, receiverId]);
+            await db.query("INSERT INTO public.transactions (user_id, amount, type, status, description) VALUES ($1,$2,'transfer_out','completed','Transfert envoyé')", [sender_id, amount]);
+            await db.query("INSERT INTO public.transactions (user_id, amount, type, status, description) VALUES ($1,$2,'transfer_in','completed','Transfert reçu')", [receiverId, amount]);
+            await db.query('COMMIT');
+            res.json({ message: "Transfert effectué" });
+        }
     } catch (err) {
         await db.query('ROLLBACK').catch(() => {});
         res.status(500).json({ message: "Erreur transfert" });
@@ -1042,26 +1162,44 @@ app.get('/api/transactions/:id/receipt', authenticate, async (req, res) => {
 // SERVICES (Airtime, Factures)
 // ==========================================
 
-// POST /api/services/airtime
+// POST /api/services/airtime — Paiement direct via Notch Pay
 app.post('/api/services/airtime', authenticate, requireFields('user_id', 'receiver_phone', 'amount', 'operator'), async (req, res) => {
-    const { user_id, receiver_phone, amount, operator, service_type } = req.body;
+    const { user_id, receiver_phone, amount, operator, service_type, phone } = req.body;
+    if (!process.env.NOTCH_PUBLIC_KEY) {
+        return res.status(500).json({ message: "Configuration paiement manquante" });
+    }
     const reference = `AIR_${user_id}_${Date.now()}`;
     try {
-        const userResult = await db.query("SELECT balance FROM public.users WHERE id=$1", [user_id]);
-        if (userResult.rows.length === 0 || userResult.rows[0].balance < amount) {
-            return res.status(400).json({ message: "Solde insuffisant" });
+        // Enregistrer la recharge en attente
+        await db.query(`
+            INSERT INTO public.pending_transfers 
+              (sender_id, sender_phone, sender_operator, receiver_phone, receiver_operator, amount, payment_reference)
+            VALUES ($1,$2,$3,$4,$5,$6,$7)
+        `, [user_id, phone || receiver_phone, operator, receiver_phone, operator, amount, reference]);
+
+        // Initier le paiement Notch Pay
+        const response = await axios.post('https://api.notchpay.co/payments', {
+            amount,
+            currency: 'XAF',
+            reference,
+            callback: process.env.PAYMENT_CALLBACK_URL,
+            customer: { name: `User ${user_id}`, email: `user${user_id}@g-caisse.com`, phone: phone || receiver_phone }
+        }, {
+            headers: {
+                'Authorization': process.env.NOTCH_PUBLIC_KEY,
+                'Content-Type': 'application/json'
+            }
+        });
+
+        const data = response.data;
+        const paymentUrl = data?.transaction?.payment_url || data?.authorization_url || data?.payment_url;
+        if (!paymentUrl) {
+            return res.status(400).json({ message: "URL de paiement non reçue", details: data });
         }
-        await db.query('BEGIN');
-        await db.query("UPDATE public.users SET balance = balance - $1 WHERE id=$2", [amount, user_id]);
-        await db.query(
-            "INSERT INTO public.transactions (user_id, amount, type, status, reference, description) VALUES ($1,$2,'airtime','completed',$3,$4)",
-            [user_id, amount, reference, `Recharge ${operator} - ${receiver_phone}`]
-        );
-        await db.query('COMMIT');
-        res.json({ success: true, reference, message: "Recharge effectuée" });
+        res.json({ success: true, payment_url: paymentUrl, reference, message: "Recharge initiée" });
     } catch (err) {
-        await db.query('ROLLBACK').catch(() => {});
-        res.status(500).json({ message: "Erreur recharge" });
+        console.error('[AIRTIME ERROR]', err.response?.data || err.message);
+        res.status(400).json({ message: err.response?.data?.message || "Erreur recharge" });
     }
 });
 
@@ -1076,27 +1214,45 @@ app.get('/api/services/airtime/status/:ref', authenticate, async (req, res) => {
     }
 });
 
-// POST /api/services/:billType (eneo, camwater, etc.)
-app.post('/api/services/:billType', authenticate, requireFields('user_id', 'amount'), async (req, res) => {
-    const { user_id, amount, contract_number } = req.body;
+// POST /api/services/:billType (eneo, camwater, etc.) — Paiement direct via Notch Pay
+app.post('/api/services/:billType', authenticate, requireFields('user_id', 'amount', 'phone'), async (req, res) => {
+    const { user_id, amount, contract_number, phone, operator } = req.body;
     const { billType } = req.params;
+    if (!process.env.NOTCH_PUBLIC_KEY) {
+        return res.status(500).json({ message: "Configuration paiement manquante" });
+    }
     const reference = `BILL_${billType.toUpperCase()}_${user_id}_${Date.now()}`;
     try {
-        const userResult = await db.query("SELECT balance FROM public.users WHERE id=$1", [user_id]);
-        if (userResult.rows.length === 0 || userResult.rows[0].balance < amount) {
-            return res.status(400).json({ message: "Solde insuffisant" });
+        // Enregistrer la facture en attente
+        await db.query(`
+            INSERT INTO public.pending_transfers 
+              (sender_id, sender_phone, sender_operator, receiver_phone, receiver_operator, amount, payment_reference)
+            VALUES ($1,$2,$3,$4,$5,$6,$7)
+        `, [user_id, phone, operator || 'cm.mtn', `BILL_${billType}`, operator || 'cm.mtn', amount, reference]);
+
+        // Initier le paiement Notch Pay
+        const response = await axios.post('https://api.notchpay.co/payments', {
+            amount,
+            currency: 'XAF',
+            reference,
+            callback: process.env.PAYMENT_CALLBACK_URL,
+            customer: { name: `User ${user_id}`, email: `user${user_id}@g-caisse.com`, phone }
+        }, {
+            headers: {
+                'Authorization': process.env.NOTCH_PUBLIC_KEY,
+                'Content-Type': 'application/json'
+            }
+        });
+
+        const data = response.data;
+        const paymentUrl = data?.transaction?.payment_url || data?.authorization_url || data?.payment_url;
+        if (!paymentUrl) {
+            return res.status(400).json({ message: "URL de paiement non reçue", details: data });
         }
-        await db.query('BEGIN');
-        await db.query("UPDATE public.users SET balance = balance - $1 WHERE id=$2", [amount, user_id]);
-        await db.query(
-            "INSERT INTO public.transactions (user_id, amount, type, status, reference, description) VALUES ($1,$2,'bill','completed',$3,$4)",
-            [user_id, amount, reference, `Facture ${billType.toUpperCase()} - ${contract_number || ''}`]
-        );
-        await db.query('COMMIT');
-        res.json({ success: true, reference, message: `Facture ${billType} payée` });
+        res.json({ success: true, payment_url: paymentUrl, reference, message: `Facture ${billType} - Paiement initié` });
     } catch (err) {
-        await db.query('ROLLBACK').catch(() => {});
-        res.status(500).json({ message: "Erreur paiement facture" });
+        console.error('[BILL PAYMENT ERROR]', err.response?.data || err.message);
+        res.status(400).json({ message: err.response?.data?.message || `Erreur paiement facture ${billType}` });
     }
 });
 
@@ -1227,9 +1383,268 @@ app.post('/api/social/donate', authenticate, requireFields('event_id', 'amount',
 // GET /api/admin/stats
 app.get('/api/admin/stats', authenticate, async (req, res) => {
     try {
-        const fees = await db.query("SELECT COALESCE(SUM(amount * 0.02),0) as total_fees FROM public.transactions WHERE status='completed'");
+        // Commissions réellement collectées
+        const fees = await db.query("SELECT COALESCE(SUM(commission_amount),0) as total_fees FROM public.platform_commissions");
         const volume = await db.query("SELECT COALESCE(SUM(amount),0) as total_volume FROM public.transactions WHERE status='completed'");
-        res.json({ total_fees: fees.rows[0].total_fees, total_volume: volume.rows[0].total_volume });
+        const users = await db.query("SELECT COUNT(*) as user_count FROM public.users");
+        const tontines = await db.query("SELECT COUNT(*) as tontine_count FROM public.tontines WHERE status='active'");
+        const commissions = await db.query(`
+            SELECT pc.*, t.name as tontine_name 
+            FROM public.platform_commissions pc
+            LEFT JOIN public.tontines t ON t.id = pc.tontine_id
+            ORDER BY pc.created_at DESC LIMIT 20
+        `);
+        res.json({
+            total_fees: fees.rows[0].total_fees,
+            total_volume: volume.rows[0].total_volume,
+            user_count: users.rows[0].user_count,
+            tontine_count: tontines.rows[0].tontine_count,
+            recent_commissions: commissions.rows
+        });
+    } catch (err) {
+        res.status(500).json({ message: "Erreur serveur" });
+    }
+});
+
+// ==========================================
+// PARRAINAGE
+// ==========================================
+
+// GET /api/referral/code/:userId
+app.get('/api/referral/code/:userId', authenticate, async (req, res) => {
+    try {
+        const result = await db.query("SELECT referral_code, fullname FROM public.users WHERE id=$1", [req.params.userId]);
+        if (result.rows.length === 0) return res.status(404).json({ message: "Utilisateur non trouvé" });
+        const referrals = await db.query("SELECT COUNT(*) as count FROM public.referrals WHERE referrer_id=$1", [req.params.userId]);
+        res.json({
+            referral_code: result.rows[0].referral_code,
+            fullname: result.rows[0].fullname,
+            total_referrals: parseInt(referrals.rows[0].count),
+            bonus_per_referral: 500,
+        });
+    } catch (err) {
+        res.status(500).json({ message: "Erreur serveur" });
+    }
+});
+
+// GET /api/referral/history/:userId
+app.get('/api/referral/history/:userId', authenticate, async (req, res) => {
+    try {
+        const result = await db.query(`
+            SELECT r.*, u.fullname as referred_name, u.phone as referred_phone
+            FROM public.referrals r
+            JOIN public.users u ON u.id = r.referred_id
+            WHERE r.referrer_id=$1
+            ORDER BY r.created_at DESC
+        `, [req.params.userId]);
+        res.json(result.rows);
+    } catch (err) {
+        res.status(500).json({ message: "Erreur serveur" });
+    }
+});
+
+// ==========================================
+// SCORE DE CONFIANCE & PREUVE VIDÉO
+// ==========================================
+
+// GET /api/users/:userId/trust-details
+app.get('/api/users/:userId/trust-details', authenticate, async (req, res) => {
+    try {
+        const user = await db.query("SELECT credibility_score, created_at FROM public.users WHERE id=$1", [req.params.userId]);
+        if (user.rows.length === 0) return res.status(404).json({ message: "Utilisateur non trouvé" });
+
+        const payments = await db.query("SELECT COUNT(*) as count FROM public.tontine_payments WHERE user_id=$1 AND is_late=false", [req.params.userId]);
+        const latePayments = await db.query("SELECT COUNT(*) as count FROM public.tontine_payments WHERE user_id=$1 AND is_late=true", [req.params.userId]);
+        const referrals = await db.query("SELECT COUNT(*) as count FROM public.referrals WHERE referrer_id=$1", [req.params.userId]);
+        const tontines = await db.query("SELECT COUNT(*) as count FROM public.tontine_members WHERE user_id=$1", [req.params.userId]);
+
+        const onTime = parseInt(payments.rows[0].count);
+        const late = parseInt(latePayments.rows[0].count);
+        const total = onTime + late;
+        const score = total > 0 ? Math.round((onTime / total) * 100) : user.rows[0].credibility_score;
+
+        res.json({
+            score: Math.min(100, Math.max(0, score)),
+            on_time_payments: onTime,
+            late_payments: late,
+            referrals_count: parseInt(referrals.rows[0].count),
+            tontines_count: parseInt(tontines.rows[0].count),
+            member_since: user.rows[0].created_at,
+        });
+    } catch (err) {
+        res.status(500).json({ message: "Erreur serveur" });
+    }
+});
+
+// POST /api/tontines/:id/payout/:payoutId/proof
+app.post('/api/tontines/:id/payout/:payoutId/proof', authenticate, requireFields('video_url'), async (req, res) => {
+    try {
+        await db.query("UPDATE public.tontine_payouts SET proof_video_url=$1 WHERE id=$2 AND tontine_id=$3",
+            [req.body.video_url, req.params.payoutId, req.params.id]);
+        res.json({ message: "Preuve vidéo enregistrée" });
+    } catch (err) {
+        res.status(500).json({ message: "Erreur serveur" });
+    }
+});
+
+// ==========================================
+// TRANSFERT DIRECT OM/MoMo
+// ==========================================
+
+// POST /api/transfer/direct — Initie un transfert direct via Notch Pay
+app.post('/api/transfer/direct', authenticate, requireFields('sender_id', 'sender_phone', 'sender_operator', 'receiver_phone', 'receiver_operator', 'amount'), async (req, res) => {
+    const { sender_id, sender_phone, sender_operator, receiver_phone, receiver_operator, amount } = req.body;
+    try {
+        if (!process.env.NOTCH_PUBLIC_KEY) {
+            return res.status(500).json({ message: "Configuration paiement manquante" });
+        }
+        const reference = `XFER_${sender_id}_${Date.now()}`;
+
+        // Enregistrer le transfert en attente
+        await db.query(`
+            INSERT INTO public.pending_transfers 
+              (sender_id, sender_phone, sender_operator, receiver_phone, receiver_operator, amount, payment_reference)
+            VALUES ($1,$2,$3,$4,$5,$6,$7)
+        `, [sender_id, sender_phone, sender_operator, receiver_phone, receiver_operator, amount, reference]);
+
+        // Initier le paiement Notch Pay (l'utilisateur paie depuis son OM/MoMo)
+        const response = await axios.post('https://api.notchpay.co/payments', {
+            amount,
+            currency: 'XAF',
+            reference,
+            callback: process.env.PAYMENT_CALLBACK_URL,
+            customer: { name: `User ${sender_id}`, email: `user${sender_id}@g-caisse.com`, phone: sender_phone }
+        }, {
+            headers: {
+                'Authorization': process.env.NOTCH_PUBLIC_KEY,
+                'Content-Type': 'application/json'
+            }
+        });
+
+        const data = response.data;
+        const paymentUrl = data?.transaction?.payment_url || data?.authorization_url || data?.payment_url;
+        if (!paymentUrl) {
+            return res.status(400).json({ message: "URL de paiement non reçue", details: data });
+        }
+
+        res.json({ success: true, payment_url: paymentUrl, reference });
+    } catch (err) {
+        console.error('[TRANSFER DIRECT ERROR]', err.response?.data || err.message);
+        res.status(400).json({ message: err.response?.data?.message || "Erreur initiation transfert" });
+    }
+});
+
+// GET /api/transfer/direct/status/:ref — Vérifier le statut d'un transfert
+app.get('/api/transfer/direct/status/:ref', authenticate, async (req, res) => {
+    try {
+        const result = await db.query("SELECT * FROM public.pending_transfers WHERE payment_reference=$1", [req.params.ref]);
+        if (result.rows.length === 0) return res.status(404).json({ message: "Transfert non trouvé" });
+        res.json(result.rows[0]);
+    } catch (err) {
+        res.status(500).json({ message: "Erreur serveur" });
+    }
+});
+
+// ==========================================
+// DÉPÔT PAR VIREMENT BANCAIRE
+// ==========================================
+
+// Coordonnées bancaires de la plateforme (à configurer)
+const BANK_INFO = {
+    bank_name: process.env.BANK_NAME || 'UBA Cameroun',
+    account_name: process.env.BANK_ACCOUNT_NAME || 'G-CAISSE SARL',
+    account_number: process.env.BANK_ACCOUNT_NUMBER || '0000000000',
+    iban: process.env.BANK_IBAN || '',
+    swift: process.env.BANK_SWIFT || '',
+};
+
+// POST /api/bank-deposit — L'utilisateur déclare un virement
+app.post('/api/bank-deposit', authenticate, requireFields('user_id', 'amount', 'bank_name'), async (req, res) => {
+    const { user_id, amount, bank_name, sender_name } = req.body;
+    try {
+        const reference = `VIR_${user_id}_${Date.now()}`;
+        await db.query(`
+            INSERT INTO public.bank_deposits (user_id, amount, reference, bank_name, sender_name)
+            VALUES ($1, $2, $3, $4, $5)
+        `, [user_id, amount, reference, bank_name, sender_name || '']);
+        res.status(201).json({
+            message: "Déclaration enregistrée. Crédité après vérification.",
+            reference,
+            bank_info: BANK_INFO,
+        });
+    } catch (err) {
+        res.status(500).json({ message: "Erreur serveur" });
+    }
+});
+
+// GET /api/bank-deposit/info — Coordonnées bancaires de la plateforme
+app.get('/api/bank-deposit/info', authenticate, (req, res) => {
+    res.json(BANK_INFO);
+});
+
+// GET /api/bank-deposit/my — Liste des dépôts bancaires de l'utilisateur
+app.get('/api/bank-deposit/my', authenticate, async (req, res) => {
+    try {
+        const result = await db.query(
+            "SELECT * FROM public.bank_deposits WHERE user_id=$1 ORDER BY created_at DESC LIMIT 20",
+            [req.query.user_id || req.user.id]
+        );
+        res.json(result.rows);
+    } catch (err) {
+        res.status(500).json({ message: "Erreur serveur" });
+    }
+});
+
+// GET /api/admin/bank-deposits — Liste des dépôts en attente (admin)
+app.get('/api/admin/bank-deposits', authenticate, async (req, res) => {
+    try {
+        const status = req.query.status || 'pending';
+        const result = await db.query(`
+            SELECT bd.*, u.fullname as user_name, u.phone as user_phone
+            FROM public.bank_deposits bd
+            JOIN public.users u ON u.id = bd.user_id
+            WHERE bd.status = $1
+            ORDER BY bd.created_at DESC
+        `, [status]);
+        res.json(result.rows);
+    } catch (err) {
+        res.status(500).json({ message: "Erreur serveur" });
+    }
+});
+
+// POST /api/admin/bank-deposits/:id/validate — Valider et créditer un virement (admin)
+app.post('/api/admin/bank-deposits/:id/validate', authenticate, async (req, res) => {
+    const { id } = req.params;
+    const { admin_note } = req.body;
+    try {
+        const deposit = await db.query("SELECT * FROM public.bank_deposits WHERE id=$1 AND status='pending'", [id]);
+        if (deposit.rows.length === 0) return res.status(404).json({ message: "Dépôt non trouvé ou déjà traité" });
+        const d = deposit.rows[0];
+
+        await db.query('BEGIN');
+        await db.query("UPDATE public.users SET balance = balance + $1 WHERE id=$2", [d.amount, d.user_id]);
+        await db.query("UPDATE public.bank_deposits SET status='validated', admin_note=$1, validated_by=$2, validated_at=NOW() WHERE id=$3",
+            [admin_note || '', req.user.id, id]);
+        await db.query(
+            "INSERT INTO public.transactions (user_id, amount, type, status, reference, description) VALUES ($1,$2,'deposit','completed',$3,$4)",
+            [d.user_id, d.amount, d.reference, `Virement bancaire validé - ${d.bank_name}`]
+        );
+        await db.query('COMMIT');
+        res.json({ message: "Virement validé et compte crédité" });
+    } catch (err) {
+        await db.query('ROLLBACK').catch(() => {});
+        res.status(500).json({ message: "Erreur serveur" });
+    }
+});
+
+// POST /api/admin/bank-deposits/:id/reject — Rejeter un virement (admin)
+app.post('/api/admin/bank-deposits/:id/reject', authenticate, async (req, res) => {
+    const { id } = req.params;
+    const { admin_note } = req.body;
+    try {
+        await db.query("UPDATE public.bank_deposits SET status='rejected', admin_note=$1, validated_by=$2, validated_at=NOW() WHERE id=$3 AND status='pending'",
+            [admin_note || 'Non vérifié', req.user.id, id]);
+        res.json({ message: "Virement rejeté" });
     } catch (err) {
         res.status(500).json({ message: "Erreur serveur" });
     }
@@ -1249,20 +1664,101 @@ app.post('/api/webhook', express.raw({ type: 'application/json' }), async (req, 
     const event = JSON.parse(rawBody);
     if (event.type === 'payment.complete') {
         const { amount, reference } = event.data;
-        const userId = reference.split('_')[1];
-        if (reference.startsWith('DEP_') && userId) {
+
+        // Dépôt classique (balance G-Caisse)
+        if (reference.startsWith('DEP_')) {
+            const userId = reference.split('_')[1];
+            if (userId) {
+                try {
+                    await db.query('BEGIN');
+                    await db.query("UPDATE public.users SET balance = balance + $1 WHERE id=$2", [amount, userId]);
+                    await db.query(
+                        "INSERT INTO public.transactions (user_id, amount, type, status, reference, description) VALUES ($1,$2,'deposit','completed',$3,'Dépôt Notch Pay')",
+                        [userId, amount, reference]
+                    );
+                    await db.query('COMMIT');
+                    return res.status(200).send('OK');
+                } catch (err) {
+                    await db.query('ROLLBACK').catch(() => {});
+                    return res.status(500).send('DB Error');
+                }
+            }
+        }
+
+        // Transfert direct OM↔MoMo
+        if (reference.startsWith('XFER_')) {
             try {
-                await db.query('BEGIN');
-                await db.query("UPDATE public.users SET balance = balance + $1 WHERE id=$2", [amount, userId]);
+                const pending = await db.query("SELECT * FROM public.pending_transfers WHERE payment_reference=$1 AND status='pending'", [reference]);
+                if (pending.rows.length === 0) return res.status(200).send('Already processed');
+                const pt = pending.rows[0];
+
+                // Envoyer l'argent au destinataire via Notch Pay
+                const notchChannel = pt.receiver_operator === 'cm.orange' ? 'cm.orange' : 'cm.mtn';
+                await axios.post('https://api.notchpay.co/transfers', {
+                    amount: pt.amount, currency: 'XAF', reference: `PAY_${reference}`,
+                    destination: { channel: notchChannel, number: pt.receiver_phone, name: 'G-Caisse Transfer' }
+                }, {
+                    headers: {
+                        'Authorization': process.env.NOTCH_PUBLIC_KEY,
+                        'X-Grant': process.env.NOTCH_PRIVATE_KEY,
+                        'Content-Type': 'application/json'
+                    }
+                });
+
+                // Marquer comme complété
+                await db.query("UPDATE public.pending_transfers SET status='completed' WHERE id=$1", [pt.id]);
                 await db.query(
-                    "INSERT INTO public.transactions (user_id, amount, type, status, reference, description) VALUES ($1,$2,'deposit','completed',$3,'Dépôt Notch Pay')",
-                    [userId, amount, reference]
+                    "INSERT INTO public.transactions (user_id, amount, type, status, reference, description) VALUES ($1,$2,'transfer_out','completed',$3,$4)",
+                    [pt.sender_id, pt.amount, reference, `Transfert ${pt.sender_operator} → ${pt.receiver_operator} vers ${pt.receiver_phone}`]
                 );
-                await db.query('COMMIT');
                 return res.status(200).send('OK');
             } catch (err) {
-                await db.query('ROLLBACK').catch(() => {});
-                return res.status(500).send('DB Error');
+                console.error('[WEBHOOK XFER ERROR]', err.response?.data || err.message);
+                await db.query("UPDATE public.pending_transfers SET status='failed' WHERE payment_reference=$1", [reference]).catch(() => {});
+                return res.status(500).send('Transfer Error');
+            }
+        }
+
+        // Paiement de facture (ENEO, CamWater, etc.)
+        if (reference.startsWith('BILL_')) {
+            try {
+                const pending = await db.query("SELECT * FROM public.pending_transfers WHERE payment_reference=$1 AND status='pending'", [reference]);
+                if (pending.rows.length === 0) return res.status(200).send('Already processed');
+                const pt = pending.rows[0];
+                const billName = pt.receiver_phone.replace('BILL_', '');
+
+                // Marquer comme payé
+                await db.query("UPDATE public.pending_transfers SET status='completed' WHERE id=$1", [pt.id]);
+                await db.query(
+                    "INSERT INTO public.transactions (user_id, amount, type, status, reference, description) VALUES ($1,$2,'bill','completed',$3,$4)",
+                    [pt.sender_id, pt.amount, reference, `Facture ${billName} payée`]
+                );
+                return res.status(200).send('OK');
+            } catch (err) {
+                console.error('[WEBHOOK BILL ERROR]', err.message);
+                await db.query("UPDATE public.pending_transfers SET status='failed' WHERE payment_reference=$1", [reference]).catch(() => {});
+                return res.status(500).send('Bill Error');
+            }
+        }
+
+        // Recharge airtime/data
+        if (reference.startsWith('AIR_')) {
+            try {
+                const pending = await db.query("SELECT * FROM public.pending_transfers WHERE payment_reference=$1 AND status='pending'", [reference]);
+                if (pending.rows.length === 0) return res.status(200).send('Already processed');
+                const pt = pending.rows[0];
+
+                // Marquer comme payé
+                await db.query("UPDATE public.pending_transfers SET status='completed' WHERE id=$1", [pt.id]);
+                await db.query(
+                    "INSERT INTO public.transactions (user_id, amount, type, status, reference, description) VALUES ($1,$2,'airtime','completed',$3,$4)",
+                    [pt.sender_id, pt.amount, reference, `Recharge ${pt.receiver_operator} - ${pt.receiver_phone}`]
+                );
+                return res.status(200).send('OK');
+            } catch (err) {
+                console.error('[WEBHOOK AIRTIME ERROR]', err.message);
+                await db.query("UPDATE public.pending_transfers SET status='failed' WHERE payment_reference=$1", [reference]).catch(() => {});
+                return res.status(500).send('Airtime Error');
             }
         }
     }
