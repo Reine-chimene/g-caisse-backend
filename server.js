@@ -243,6 +243,73 @@ const initDb = async () => {
         }
 
         console.log("✅ Base de données prête.");
+
+        // === NOUVELLES FONCTIONNALITÉS ===
+
+        // Demandes d'argent (Request Money)
+        await db.query(`CREATE TABLE IF NOT EXISTS public.money_requests (
+            id SERIAL PRIMARY KEY,
+            sender_id INTEGER REFERENCES public.users(id),
+            receiver_id INTEGER REFERENCES public.users(id),
+            amount DECIMAL NOT NULL,
+            message TEXT,
+            status TEXT DEFAULT 'pending',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            responded_at TIMESTAMP
+        )`);
+
+        // Partage de dépenses (Split Bill)
+        await db.query(`CREATE TABLE IF NOT EXISTS public.split_bills (
+            id SERIAL PRIMARY KEY,
+            creator_id INTEGER REFERENCES public.users(id),
+            title TEXT NOT NULL,
+            total_amount DECIMAL NOT NULL,
+            split_type TEXT DEFAULT 'equal',
+            status TEXT DEFAULT 'active',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )`);
+        await db.query(`CREATE TABLE IF NOT EXISTS public.split_bill_participants (
+            id SERIAL PRIMARY KEY,
+            split_bill_id INTEGER REFERENCES public.split_bills(id),
+            user_id INTEGER REFERENCES public.users(id),
+            amount_owed DECIMAL NOT NULL,
+            amount_paid DECIMAL DEFAULT 0,
+            status TEXT DEFAULT 'pending',
+            paid_at TIMESTAMP,
+            UNIQUE(split_bill_id, user_id)
+        )`);
+
+        // Épargne automatique (Round-Up)
+        await db.query(`ALTER TABLE public.users ADD COLUMN IF NOT EXISTS round_up_enabled BOOLEAN DEFAULT false`);
+        await db.query(`ALTER TABLE public.users ADD COLUMN IF NOT EXISTS round_up_savings DECIMAL DEFAULT 0`);
+
+        // Notifications
+        await db.query(`CREATE TABLE IF NOT EXISTS public.notifications (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER REFERENCES public.users(id),
+            title TEXT NOT NULL,
+            body TEXT NOT NULL,
+            type TEXT DEFAULT 'info',
+            is_read BOOLEAN DEFAULT false,
+            reference_id TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )`);
+
+        // Paiements programmés
+        await db.query(`CREATE TABLE IF NOT EXISTS public.scheduled_payments (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER REFERENCES public.users(id),
+            payment_type TEXT NOT NULL,
+            target_id INTEGER,
+            amount DECIMAL NOT NULL,
+            frequency TEXT DEFAULT 'monthly',
+            next_payment_date DATE NOT NULL,
+            is_active BOOLEAN DEFAULT true,
+            description TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )`);
+
+        console.log("✅ Nouvelles tables créées.");
     } catch (err) {
         console.error("❌ Erreur DB:", err.message);
     }
@@ -595,6 +662,7 @@ app.post('/api/payments/tontine', authenticate, requireFields('user_id', 'tontin
             );
         }
         await db.query('COMMIT');
+        applyRoundUp(user_id, amount);
         res.json({ message: "Paiement effectué" });
     } catch (err) {
         await db.query('ROLLBACK');
@@ -1084,11 +1152,18 @@ app.post('/api/payout', authenticate, requireFields('user_id', 'amount', 'phone'
             return res.status(500).json({ message: "Configuration paiement manquante" });
         }
         const reference = `PAY_${user_id}_${Date.now()}`;
+        const transferChannel = channel || 'cm.mobile';
+        const formattedPhone = phone.startsWith('+') ? phone : `+237${phone.replace(/^0/, '')}`;
         const response = await axios.post('https://api.notchpay.co/transfers', {
-            amount, currency: 'XAF', reference,
-            destination: { channel: channel || 'cm.mobile', number: phone, name }
+            amount,
+            currency: 'XAF',
+            reference,
+            recipient: formattedPhone,
+            channel: transferChannel,
+            description: `Retrait G-Caisse vers ${name}`
         }, { headers: { 'Authorization': process.env.NOTCH_PUBLIC_KEY, 'X-Grant': process.env.NOTCH_PRIVATE_KEY, 'Content-Type': 'application/json' } });
 
+        const transferStatus = response.data?.transfer?.status || 'sent';
         await db.query('BEGIN');
         await db.query("UPDATE public.users SET balance = balance - $1 WHERE id=$2", [amount, user_id]);
         await db.query(
@@ -1096,9 +1171,10 @@ app.post('/api/payout', authenticate, requireFields('user_id', 'amount', 'phone'
             [user_id, amount, reference]
         );
         await db.query('COMMIT');
-        res.json({ success: true, data: response.data });
+        res.json({ success: true, data: response.data, transfer_status: transferStatus });
     } catch (err) {
         await db.query('ROLLBACK').catch(() => {});
+        console.error('[PAYOUT ERROR]', err.response?.data || err.message);
         res.status(400).json({ message: err.response?.data?.message || "Erreur retrait" });
     }
 });
@@ -1125,9 +1201,14 @@ app.post('/api/transfer', authenticate, requireFields('sender_id', 'receiver_pho
             }
             const reference = `XFER_${sender_id}_${Date.now()}`;
             try {
+                const formattedPhone = receiver_phone.startsWith('+') ? receiver_phone : `+237${receiver_phone.replace(/^0/, '')}`;
                 const notchRes = await axios.post('https://api.notchpay.co/transfers', {
-                    amount, currency: 'XAF', reference,
-                    destination: { channel: operator, number: receiver_phone, name: sender.rows[0].fullname }
+                    amount,
+                    currency: 'XAF',
+                    reference,
+                    recipient: formattedPhone,
+                    channel: operator,
+                    description: `Transfert G-Caisse vers ${receiver_phone}`
                 }, { headers: { 'Authorization': process.env.NOTCH_PUBLIC_KEY, 'X-Grant': process.env.NOTCH_PRIVATE_KEY, 'Content-Type': 'application/json' } });
 
                 await db.query("INSERT INTO public.transactions (user_id, amount, type, status, reference, description) VALUES ($1,$2,'transfer_out','completed',$3,$4)",
@@ -1152,6 +1233,7 @@ app.post('/api/transfer', authenticate, requireFields('sender_id', 'receiver_pho
             await db.query("INSERT INTO public.transactions (user_id, amount, type, status, description) VALUES ($1,$2,'transfer_out','completed','Transfert envoyé')", [sender_id, amount]);
             await db.query("INSERT INTO public.transactions (user_id, amount, type, status, description) VALUES ($1,$2,'transfer_in','completed','Transfert reçu')", [receiverId, amount]);
             await db.query('COMMIT');
+            applyRoundUp(sender_id, amount);
             res.json({ message: "Transfert effectué" });
         }
     } catch (err) {
@@ -1175,42 +1257,51 @@ app.get('/api/transactions/:id/receipt', authenticate, async (req, res) => {
 // SERVICES (Airtime, Factures)
 // ==========================================
 
-// POST /api/services/airtime — Paiement direct via Notch Pay
+// POST /api/services/airtime — Recharge depuis le solde G-Caisse via Notch Pay Transfers
 app.post('/api/services/airtime', authenticate, requireFields('user_id', 'receiver_phone', 'amount', 'operator'), async (req, res) => {
-    const { user_id, receiver_phone, amount, operator, service_type, phone } = req.body;
-    if (!process.env.NOTCH_PUBLIC_KEY) {
+    const { user_id, receiver_phone, amount, operator } = req.body;
+    if (!process.env.NOTCH_PRIVATE_KEY) {
         return res.status(500).json({ message: "Configuration paiement manquante" });
     }
-    const reference = `AIR_${user_id}_${Date.now()}`;
     try {
-        // Enregistrer la recharge en attente
-        await db.query(`
-            INSERT INTO public.pending_transfers 
-              (sender_id, sender_phone, sender_operator, receiver_phone, receiver_operator, amount, payment_reference)
-            VALUES ($1,$2,$3,$4,$5,$6,$7)
-        `, [user_id, phone || receiver_phone, operator, receiver_phone, operator, amount, reference]);
+        // Vérifier le solde G-Caisse
+        const userResult = await db.query("SELECT balance FROM public.users WHERE id=$1", [user_id]);
+        if (userResult.rows.length === 0 || userResult.rows[0].balance < amount) {
+            return res.status(400).json({ message: "Solde insuffisant" });
+        }
 
-        // Initier le paiement Notch Pay
-        const response = await axios.post('https://api.notchpay.co/payments', {
+        const reference = `AIR_${user_id}_${Date.now()}`;
+        const notchChannel = operator === 'cm.orange' ? 'cm.orange' : 'cm.mtn';
+        const formattedPhone = receiver_phone.startsWith('+') ? receiver_phone : `+237${receiver_phone.replace(/^0/, '')}`;
+
+        // Transférer l'argent au téléphone via Notch Pay (l'utilisateur reçoit du mobile money)
+        await axios.post('https://api.notchpay.co/transfers', {
             amount,
             currency: 'XAF',
             reference,
-            callback: process.env.PAYMENT_CALLBACK_URL,
-            customer: { name: `User ${user_id}`, email: `user${user_id}@g-caisse.com`, phone: phone || receiver_phone }
+            recipient: formattedPhone,
+            channel: notchChannel,
+            description: `Recharge G-Caisse vers ${receiver_phone}`
         }, {
             headers: {
                 'Authorization': process.env.NOTCH_PUBLIC_KEY,
+                'X-Grant': process.env.NOTCH_PRIVATE_KEY,
                 'Content-Type': 'application/json'
             }
         });
 
-        const data = response.data;
-        const paymentUrl = data?.transaction?.payment_url || data?.authorization_url || data?.payment_url;
-        if (!paymentUrl) {
-            return res.status(400).json({ message: "URL de paiement non reçue", details: data });
-        }
-        res.json({ success: true, payment_url: paymentUrl, reference, message: "Recharge initiée" });
+        // Débiter le solde G-Caisse
+        await db.query('BEGIN');
+        await db.query("UPDATE public.users SET balance = balance - $1 WHERE id=$2", [amount, user_id]);
+        await db.query(
+            "INSERT INTO public.transactions (user_id, amount, type, status, reference, description) VALUES ($1,$2,'airtime','completed',$3,$4)",
+            [user_id, amount, reference, `Recharge ${operator} - ${receiver_phone}`]
+        );
+        await db.query('COMMIT');
+
+        res.json({ success: true, reference, message: "Recharge effectuée avec succès" });
     } catch (err) {
+        await db.query('ROLLBACK').catch(() => {});
         console.error('[AIRTIME ERROR]', err.response?.data || err.message);
         res.status(400).json({ message: err.response?.data?.message || "Erreur recharge" });
     }
@@ -1227,43 +1318,52 @@ app.get('/api/services/airtime/status/:ref', authenticate, async (req, res) => {
     }
 });
 
-// POST /api/services/:billType (eneo, camwater, etc.) — Paiement direct via Notch Pay
+// POST /api/services/:billType (eneo, camwater, SCHOOL, etc.) — Débité depuis le solde G-Caisse
 app.post('/api/services/:billType', authenticate, requireFields('user_id', 'amount', 'phone'), async (req, res) => {
     const { user_id, amount, contract_number, phone, operator } = req.body;
     const { billType } = req.params;
-    if (!process.env.NOTCH_PUBLIC_KEY) {
+    if (!process.env.NOTCH_PRIVATE_KEY) {
         return res.status(500).json({ message: "Configuration paiement manquante" });
     }
-    const reference = `BILL_${billType.toUpperCase()}_${user_id}_${Date.now()}`;
     try {
-        // Enregistrer la facture en attente
-        await db.query(`
-            INSERT INTO public.pending_transfers 
-              (sender_id, sender_phone, sender_operator, receiver_phone, receiver_operator, amount, payment_reference)
-            VALUES ($1,$2,$3,$4,$5,$6,$7)
-        `, [user_id, phone, operator || 'cm.mtn', `BILL_${billType}`, operator || 'cm.mtn', amount, reference]);
+        // Vérifier le solde
+        const userResult = await db.query("SELECT balance FROM public.users WHERE id=$1", [user_id]);
+        if (userResult.rows.length === 0 || userResult.rows[0].balance < amount) {
+            return res.status(400).json({ message: "Solde insuffisant" });
+        }
 
-        // Initier le paiement Notch Pay
-        const response = await axios.post('https://api.notchpay.co/payments', {
+        const reference = `BILL_${billType.toUpperCase()}_${user_id}_${Date.now()}`;
+        const notchChannel = operator === 'cm.orange' ? 'cm.orange' : 'cm.mtn';
+        const formattedPhone = phone.startsWith('+') ? phone : `+237${phone.replace(/^0/, '')}`;
+
+        // Transférer via Notch Pay (l'argent va au numéro de téléphone pour payer la facture)
+        await axios.post('https://api.notchpay.co/transfers', {
             amount,
             currency: 'XAF',
             reference,
-            callback: process.env.PAYMENT_CALLBACK_URL,
-            customer: { name: `User ${user_id}`, email: `user${user_id}@g-caisse.com`, phone }
+            recipient: formattedPhone,
+            channel: notchChannel,
+            description: `Paiement ${billType} - ${contract_number || ''}`
         }, {
             headers: {
                 'Authorization': process.env.NOTCH_PUBLIC_KEY,
+                'X-Grant': process.env.NOTCH_PRIVATE_KEY,
                 'Content-Type': 'application/json'
             }
         });
 
-        const data = response.data;
-        const paymentUrl = data?.transaction?.payment_url || data?.authorization_url || data?.payment_url;
-        if (!paymentUrl) {
-            return res.status(400).json({ message: "URL de paiement non reçue", details: data });
-        }
-        res.json({ success: true, payment_url: paymentUrl, reference, message: `Facture ${billType} - Paiement initié` });
+        // Débiter le solde G-Caisse
+        await db.query('BEGIN');
+        await db.query("UPDATE public.users SET balance = balance - $1 WHERE id=$2", [amount, user_id]);
+        await db.query(
+            "INSERT INTO public.transactions (user_id, amount, type, status, reference, description) VALUES ($1,$2,'bill','completed',$3,$4)",
+            [user_id, amount, reference, `Facture ${billType} - ${contract_number || phone}`]
+        );
+        await db.query('COMMIT');
+
+        res.json({ success: true, reference, message: `Facture ${billType} payée avec succès` });
     } catch (err) {
+        await db.query('ROLLBACK').catch(() => {});
         console.error('[BILL PAYMENT ERROR]', err.response?.data || err.message);
         res.status(400).json({ message: err.response?.data?.message || `Erreur paiement facture ${billType}` });
     }
@@ -1664,17 +1764,369 @@ app.post('/api/admin/bank-deposits/:id/reject', authenticate, async (req, res) =
 });
 
 // ==========================================
+// NOUVELLES FONCTIONNALITÉS
+// ==========================================
+
+// ── 1. DEMANDE D'ARGENT (REQUEST MONEY) ──────────────────────
+
+// POST /api/money-request
+app.post('/api/money-request', authenticate, requireFields('receiver_phone', 'amount'), async (req, res) => {
+    const { receiver_phone, amount, message } = req.body;
+    const sender_id = req.user.id;
+    try {
+        const receiver = await db.query("SELECT id, fullname FROM public.users WHERE phone=$1", [receiver_phone]);
+        if (receiver.rows.length === 0) return res.status(404).json({ message: "Utilisateur non trouvé" });
+        const receiver_id = receiver.rows[0].id;
+        if (receiver_id === sender_id) return res.status(400).json({ message: "Tu ne peux pas te demander de l'argent à toi-même" });
+
+        const sender = await db.query("SELECT fullname FROM public.users WHERE id=$1", [sender_id]);
+        const result = await db.query(
+            "INSERT INTO public.money_requests (sender_id, receiver_id, amount, message) VALUES ($1,$2,$3,$4) RETURNING *",
+            [sender_id, receiver_id, amount, message || '']
+        );
+
+        await db.query(
+            "INSERT INTO public.notifications (user_id, title, body, type, reference_id) VALUES ($1,$2,$3,'money_request',$4)",
+            [receiver_id, 'Demande d\'argent', `${sender.rows[0].fullname} te demande ${amount} FCFA`, result.rows[0].id.toString()]
+        );
+
+        res.status(201).json(result.rows[0]);
+    } catch (err) {
+        console.error('[MONEY REQUEST ERROR]', err.message);
+        res.status(500).json({ message: "Erreur serveur" });
+    }
+});
+
+// GET /api/money-request/incoming
+app.get('/api/money-request/incoming', authenticate, async (req, res) => {
+    try {
+        const result = await db.query(`
+            SELECT mr.*, u.fullname as sender_name, u.phone as sender_phone
+            FROM public.money_requests mr
+            JOIN public.users u ON u.id = mr.sender_id
+            WHERE mr.receiver_id=$1 AND mr.status='pending'
+            ORDER BY mr.created_at DESC
+        `, [req.user.id]);
+        res.json(result.rows);
+    } catch (err) {
+        res.status(500).json({ message: "Erreur serveur" });
+    }
+});
+
+// GET /api/money-request/outgoing
+app.get('/api/money-request/outgoing', authenticate, async (req, res) => {
+    try {
+        const result = await db.query(`
+            SELECT mr.*, u.fullname as receiver_name, u.phone as receiver_phone
+            FROM public.money_requests mr
+            JOIN public.users u ON u.id = mr.receiver_id
+            WHERE mr.sender_id=$1
+            ORDER BY mr.created_at DESC LIMIT 20
+        `, [req.user.id]);
+        res.json(result.rows);
+    } catch (err) {
+        res.status(500).json({ message: "Erreur serveur" });
+    }
+});
+
+// POST /api/money-request/:id/accept
+app.post('/api/money-request/:id/accept', authenticate, async (req, res) => {
+    const { id } = req.params;
+    try {
+        const request = await db.query("SELECT * FROM public.money_requests WHERE id=$1 AND receiver_id=$2 AND status='pending'", [id, req.user.id]);
+        if (request.rows.length === 0) return res.status(404).json({ message: "Demande non trouvée" });
+        const r = request.rows[0];
+
+        const senderBalance = await db.query("SELECT balance FROM public.users WHERE id=$1", [r.sender_id]);
+        if (parseFloat(senderBalance.rows[0].balance) < parseFloat(r.amount)) {
+            return res.status(400).json({ message: "Le demandeur n'a pas assez de solde" });
+        }
+
+        await db.query('BEGIN');
+        await db.query("UPDATE public.users SET balance = balance - $1 WHERE id=$2", [r.amount, r.sender_id]);
+        await db.query("UPDATE public.users SET balance = balance + $1 WHERE id=$2", [r.amount, r.receiver_id]);
+        await db.query("UPDATE public.money_requests SET status='accepted', responded_at=NOW() WHERE id=$1", [id]);
+        await db.query("INSERT INTO public.transactions (user_id, amount, type, status, description) VALUES ($1,$2,'transfer_out','completed','Demande d''argent acceptée')", [r.sender_id, r.amount]);
+        await db.query("INSERT INTO public.transactions (user_id, amount, type, status, description) VALUES ($1,$2,'transfer_in','completed','Argent reçu (demande)')", [r.receiver_id, r.amount]);
+        await db.query('COMMIT');
+
+        res.json({ message: "Demande acceptée, argent transféré" });
+    } catch (err) {
+        await db.query('ROLLBACK').catch(() => {});
+        res.status(500).json({ message: "Erreur serveur" });
+    }
+});
+
+// POST /api/money-request/:id/decline
+app.post('/api/money-request/:id/decline', authenticate, async (req, res) => {
+    try {
+        await db.query("UPDATE public.money_requests SET status='declined', responded_at=NOW() WHERE id=$1 AND receiver_id=$2", [req.params.id, req.user.id]);
+        res.json({ message: "Demande refusée" });
+    } catch (err) {
+        res.status(500).json({ message: "Erreur serveur" });
+    }
+});
+
+// ── 2. PARTAGE DE DÉPENSES (SPLIT BILL) ──────────────────────
+
+// POST /api/split-bill
+app.post('/api/split-bill', authenticate, requireFields('title', 'total_amount', 'participants'), async (req, res) => {
+    const { title, total_amount, participants, split_type } = req.body;
+    const creator_id = req.user.id;
+    try {
+        const result = await db.query(
+            "INSERT INTO public.split_bills (creator_id, title, total_amount, split_type) VALUES ($1,$2,$3,$4) RETURNING *",
+            [creator_id, title, total_amount, split_type || 'equal']
+        );
+        const billId = result.rows[0].id;
+        const amountPerPerson = split_type === 'equal' ? Math.round(total_amount / (participants.length + 1) * 100) / 100 : 0;
+
+        // Ajouter le créateur
+        await db.query(
+            "INSERT INTO public.split_bill_participants (split_bill_id, user_id, amount_owed) VALUES ($1,$2,$3)",
+            [billId, creator_id, split_type === 'equal' ? amountPerPerson : (participants.find(p => p.user_id === creator_id)?.amount || 0)]
+        );
+
+        for (const p of participants) {
+            let amountOwed = split_type === 'equal' ? amountPerPerson : (p.amount || 0);
+            if (p.phone && !p.user_id) {
+                const user = await db.query("SELECT id FROM public.users WHERE phone=$1", [p.phone]);
+                if (user.rows.length > 0) {
+                    await db.query(
+                        "INSERT INTO public.split_bill_participants (split_bill_id, user_id, amount_owed) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING",
+                        [billId, user.rows[0].id, amountOwed]
+                    );
+                    await db.query(
+                        "INSERT INTO public.notifications (user_id, title, body, type, reference_id) VALUES ($1,$2,$3,'split_bill',$4)",
+                        [user.rows[0].id, 'Partage de dépenses', `Tu dois ${amountOwed} FCFA pour "${title}"`, billId.toString()]
+                    );
+                }
+            } else if (p.user_id) {
+                await db.query(
+                    "INSERT INTO public.split_bill_participants (split_bill_id, user_id, amount_owed) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING",
+                    [billId, p.user_id, amountOwed]
+                );
+            }
+        }
+        res.status(201).json(result.rows[0]);
+    } catch (err) {
+        console.error('[SPLIT BILL ERROR]', err.message);
+        res.status(500).json({ message: "Erreur serveur" });
+    }
+});
+
+// GET /api/split-bill/my
+app.get('/api/split-bill/my', authenticate, async (req, res) => {
+    try {
+        const result = await db.query(`
+            SELECT sb.*, u.fullname as creator_name,
+                (SELECT json_agg(json_build_object('user_id', sp.user_id, 'name', u2.fullname, 'amount_owed', sp.amount_owed, 'amount_paid', sp.amount_paid, 'status', sp.status))
+                 FROM public.split_bill_participants sp
+                 JOIN public.users u2 ON u2.id = sp.user_id
+                 WHERE sp.split_bill_id = sb.id) as participants
+            FROM public.split_bills sb
+            JOIN public.split_bill_participants p ON p.split_bill_id = sb.id
+            JOIN public.users u ON u.id = sb.creator_id
+            WHERE p.user_id = $1
+            ORDER BY sb.created_at DESC LIMIT 20
+        `, [req.user.id]);
+        res.json(result.rows);
+    } catch (err) {
+        res.status(500).json({ message: "Erreur serveur" });
+    }
+});
+
+// POST /api/split-bill/:id/pay
+app.post('/api/split-bill/:id/pay', authenticate, async (req, res) => {
+    const { id } = req.params;
+    const userId = req.user.id;
+    try {
+        const participant = await db.query(
+            "SELECT sp.*, sb.creator_id FROM public.split_bill_participants sp JOIN public.split_bills sb ON sb.id = sp.split_bill_id WHERE sp.split_bill_id=$1 AND sp.user_id=$2 AND sp.status='pending'",
+            [id, userId]
+        );
+        if (participant.rows.length === 0) return res.status(404).json({ message: "Participation non trouvée" });
+        const p = participant.rows[0];
+        const amountToPay = parseFloat(p.amount_owed) - parseFloat(p.amount_paid);
+
+        const userBalance = await db.query("SELECT balance FROM public.users WHERE id=$1", [userId]);
+        if (parseFloat(userBalance.rows[0].balance) < amountToPay) {
+            return res.status(400).json({ message: "Solde insuffisant" });
+        }
+
+        await db.query('BEGIN');
+        await db.query("UPDATE public.users SET balance = balance - $1 WHERE id=$2", [amountToPay, userId]);
+        await db.query("UPDATE public.users SET balance = balance + $1 WHERE id=$2", [amountToPay, p.creator_id]);
+        await db.query("UPDATE public.split_bill_participants SET amount_paid = amount_owed, status='paid', paid_at=NOW() WHERE split_bill_id=$1 AND user_id=$2", [id, userId]);
+        await db.query("INSERT INTO public.transactions (user_id, amount, type, status, description) VALUES ($1,$2,'split_bill_pay','completed','Partage de dépenses payé')", [userId, amountToPay]);
+        await db.query('COMMIT');
+        res.json({ message: "Paiement effectué" });
+    } catch (err) {
+        await db.query('ROLLBACK').catch(() => {});
+        res.status(500).json({ message: "Erreur serveur" });
+    }
+});
+
+// ── 3. ÉPARGNE AUTOMATIQUE (ROUND-UP) ─────────────────────────
+
+// PUT /api/users/:id/round-up-settings
+app.put('/api/users/:id/round-up-settings', authenticate, async (req, res) => {
+    const { enabled } = req.body;
+    try {
+        await db.query("UPDATE public.users SET round_up_enabled=$1 WHERE id=$2", [enabled, req.params.id]);
+        res.json({ message: enabled ? "Épargne automatique activée" : "Épargne automatique désactivée" });
+    } catch (err) {
+        res.status(500).json({ message: "Erreur serveur" });
+    }
+});
+
+// GET /api/users/:id/round-up-stats
+app.get('/api/users/:id/round-up-stats', authenticate, async (req, res) => {
+    try {
+        const user = await db.query("SELECT round_up_enabled, round_up_savings FROM public.users WHERE id=$1", [req.params.id]);
+        const transactions = await db.query(
+            "SELECT COUNT(*) as count, COALESCE(SUM(amount),0) as total FROM public.transactions WHERE user_id=$1 AND type='round_up'",
+            [req.params.id]
+        );
+        res.json({
+            enabled: user.rows[0]?.round_up_enabled || false,
+            total_saved: parseFloat(user.rows[0]?.round_up_savings || 0),
+            transaction_count: parseInt(transactions.rows[0]?.count || 0)
+        });
+    } catch (err) {
+        res.status(500).json({ message: "Erreur serveur" });
+    }
+});
+
+// Fonction utilitaire pour arrondir et épargner
+async function applyRoundUp(userId, amount) {
+    try {
+        const user = await db.query("SELECT round_up_enabled FROM public.users WHERE id=$1", [userId]);
+        if (!user.rows[0]?.round_up_enabled) return;
+
+        const roundAmount = Math.ceil(amount / 100) * 100;
+        const difference = roundAmount - amount;
+        if (difference <= 0 || difference >= 100) return;
+
+        await db.query("UPDATE public.users SET round_up_savings = round_up_savings + $1 WHERE id=$2", [difference, userId]);
+        await db.query(
+            "INSERT INTO public.transactions (user_id, amount, type, status, description) VALUES ($1,$2,'round_up','completed','Épargne automatique (arrondi)')",
+            [userId, difference]
+        );
+    } catch (err) {
+        console.error('[ROUND-UP ERROR]', err.message);
+    }
+}
+
+// ── 4. CENTRE DE NOTIFICATIONS ────────────────────────────────
+
+// GET /api/notifications
+app.get('/api/notifications', authenticate, async (req, res) => {
+    try {
+        const result = await db.query(
+            "SELECT * FROM public.notifications WHERE user_id=$1 ORDER BY created_at DESC LIMIT 50",
+            [req.user.id]
+        );
+        const unread = await db.query("SELECT COUNT(*) as count FROM public.notifications WHERE user_id=$1 AND is_read=false", [req.user.id]);
+        res.json({ notifications: result.rows, unread_count: parseInt(unread.rows[0].count) });
+    } catch (err) {
+        res.status(500).json({ message: "Erreur serveur" });
+    }
+});
+
+// PUT /api/notifications/:id/read
+app.put('/api/notifications/:id/read', authenticate, async (req, res) => {
+    try {
+        await db.query("UPDATE public.notifications SET is_read=true WHERE id=$1 AND user_id=$2", [req.params.id, req.user.id]);
+        res.json({ message: "Notification lue" });
+    } catch (err) {
+        res.status(500).json({ message: "Erreur serveur" });
+    }
+});
+
+// PUT /api/notifications/read-all
+app.put('/api/notifications/read-all', authenticate, async (req, res) => {
+    try {
+        await db.query("UPDATE public.notifications SET is_read=true WHERE user_id=$1", [req.user.id]);
+        res.json({ message: "Toutes les notifications marquées comme lues" });
+    } catch (err) {
+        res.status(500).json({ message: "Erreur serveur" });
+    }
+});
+
+// ── 5. PAIEMENTS PROGRAMMÉS ───────────────────────────────────
+
+// POST /api/scheduled-payment
+app.post('/api/scheduled-payment', authenticate, requireFields('payment_type', 'amount', 'next_payment_date'), async (req, res) => {
+    const { payment_type, target_id, amount, frequency, next_payment_date, description } = req.body;
+    try {
+        const result = await db.query(`
+            INSERT INTO public.scheduled_payments (user_id, payment_type, target_id, amount, frequency, next_payment_date, description)
+            VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *
+        `, [req.user.id, payment_type, target_id || null, amount, frequency || 'monthly', next_payment_date, description || '']);
+        res.status(201).json(result.rows[0]);
+    } catch (err) {
+        res.status(500).json({ message: "Erreur serveur" });
+    }
+});
+
+// GET /api/scheduled-payment/my
+app.get('/api/scheduled-payment/my', authenticate, async (req, res) => {
+    try {
+        const result = await db.query(
+            "SELECT * FROM public.scheduled_payments WHERE user_id=$1 AND is_active=true ORDER BY next_payment_date ASC",
+            [req.user.id]
+        );
+        res.json(result.rows);
+    } catch (err) {
+        res.status(500).json({ message: "Erreur serveur" });
+    }
+});
+
+// DELETE /api/scheduled-payment/:id
+app.delete('/api/scheduled-payment/:id', authenticate, async (req, res) => {
+    try {
+        await db.query("UPDATE public.scheduled_payments SET is_active=false WHERE id=$1 AND user_id=$2", [req.params.id, req.user.id]);
+        res.json({ message: "Paiement programmé annulé" });
+    } catch (err) {
+        res.status(500).json({ message: "Erreur serveur" });
+    }
+});
+
+// ==========================================
 // WEBHOOK NOTCH PAY
 // ==========================================
 app.post('/api/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
     const signature = req.headers['x-notch-signature'];
     const rawBody = req.body.toString();
-    if (!signature || !process.env.NOTCH_WEBHOOK_SECRET) return res.status(401).send('Unauthorized');
 
-    const calculatedSig = crypto.createHmac('sha256', process.env.NOTCH_WEBHOOK_SECRET).update(rawBody).digest('hex');
-    if (calculatedSig !== signature) return res.status(400).send('Invalid signature');
+    console.log('[WEBHOOK] Reçu:', rawBody.substring(0, 200));
 
-    const event = JSON.parse(rawBody);
+    // Vérification de signature (si NOTCH_WEBHOOK_SECRET est configuré)
+    if (process.env.NOTCH_WEBHOOK_SECRET) {
+        if (!signature) {
+            console.error('[WEBHOOK] Signature manquante');
+            return res.status(401).send('Unauthorized');
+        }
+        const calculatedSig = crypto.createHmac('sha256', process.env.NOTCH_WEBHOOK_SECRET).update(rawBody).digest('hex');
+        if (calculatedSig !== signature) {
+            console.error('[WEBHOOK] Signature invalide. Calculée:', calculatedSig, 'Reçue:', signature);
+            return res.status(400).send('Invalid signature');
+        }
+    } else {
+        console.warn('[WEBHOOK] NOTCH_WEBHOOK_SECRET non configuré - signature non vérifiée');
+    }
+
+    let event;
+    try {
+        event = JSON.parse(rawBody);
+    } catch (e) {
+        console.error('[WEBHOOK] JSON invalide:', e.message);
+        return res.status(400).send('Invalid JSON');
+    }
+
+    console.log('[WEBHOOK] Event:', event.type, event.data?.reference || '');
+
     if (event.type === 'payment.complete') {
         const { amount, reference } = event.data;
 
@@ -1707,9 +2159,14 @@ app.post('/api/webhook', express.raw({ type: 'application/json' }), async (req, 
 
                 // Envoyer l'argent au destinataire via Notch Pay
                 const notchChannel = pt.receiver_operator === 'cm.orange' ? 'cm.orange' : 'cm.mtn';
+                const formattedReceiverPhone = pt.receiver_phone.startsWith('+') ? pt.receiver_phone : `+237${pt.receiver_phone.replace(/^0/, '')}`;
                 await axios.post('https://api.notchpay.co/transfers', {
-                    amount: pt.amount, currency: 'XAF', reference: `PAY_${reference}`,
-                    destination: { channel: notchChannel, number: pt.receiver_phone, name: 'G-Caisse Transfer' }
+                    amount: pt.amount,
+                    currency: 'XAF',
+                    reference: `PAY_${reference}`,
+                    recipient: formattedReceiverPhone,
+                    channel: notchChannel,
+                    description: `Transfert G-Caisse ${pt.sender_operator} → ${pt.receiver_operator}`
                 }, {
                     headers: {
                         'Authorization': process.env.NOTCH_PUBLIC_KEY,
