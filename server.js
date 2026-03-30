@@ -1150,41 +1150,46 @@ app.get('/api/deposit/status/:reference', authenticate, async (req, res) => {
             return res.json({ status: 'complete', message: 'Déjà crédité' });
         }
 
-        // Interroger Notch Pay pour le statut
-        if (process.env.NOTCH_PUBLIC_KEY) {
-            try {
-                const npRes = await axios.get(`https://api.notchpay.co/payments/${reference}`, {
-                    headers: { 'Authorization': process.env.NOTCH_PUBLIC_KEY }
-                });
-                const payment = npRes.data?.transaction || npRes.data?.payment;
-                const status = payment?.status;
-
-                if (status === 'complete') {
-                    // Créditer le solde (fallback si le webhook n'a pas fonctionné)
-                    const userId = reference.split('_')[1];
-                    const amount = parseFloat(payment.amount);
-                    const alreadyExists = await db.query("SELECT id FROM public.transactions WHERE reference=$1 AND type='deposit'", [reference]);
-                    if (alreadyExists.rows.length === 0 && userId && amount > 0) {
-                        await db.query('BEGIN');
-                        await db.query("UPDATE public.users SET balance = balance + $1 WHERE id=$2", [amount, userId]);
-                        await db.query(
-                            "INSERT INTO public.transactions (user_id, amount, type, status, reference, description) VALUES ($1,$2,'deposit','completed',$3,'Dépôt confirmé')",
-                            [userId, amount, reference]
-                        );
-                        await db.query('COMMIT');
-                        console.log(`[DEPOSIT FALLBACK] Crédité ${amount} FCFA pour user ${userId} via vérification statut`);
-                    }
-                    return res.json({ status: 'complete', amount });
-                }
-                return res.json({ status: status || 'pending' });
-            } catch (npErr) {
-                console.error('[DEPOSIT STATUS] Erreur Notch Pay:', npErr.message);
+        // Vérifier aussi si un dépôt récent existe pour cet utilisateur
+        if (reference.startsWith('DEP_')) {
+            const userId = reference.split('_')[1];
+            const recentDeposit = await db.query(
+                "SELECT id FROM public.transactions WHERE user_id=$1 AND type='deposit' AND reference=$2",
+                [userId, reference]
+            );
+            if (recentDeposit.rows.length > 0) {
+                return res.json({ status: 'complete', message: 'Déjà crédité' });
             }
         }
 
         res.json({ status: 'pending', message: 'En attente de confirmation' });
     } catch (err) {
         console.error('[DEPOSIT STATUS ERROR]', err.message);
+        res.status(500).json({ message: "Erreur serveur" });
+    }
+});
+
+// GET /api/deposit/verify/:userId — Vérifier les dépôts récents d'un utilisateur et créditer si nécessaire
+app.get('/api/deposit/verify/:userId', authenticate, async (req, res) => {
+    const userId = req.params.userId;
+    try {
+        // Récupérer le solde actuel
+        const user = await db.query("SELECT balance FROM public.users WHERE id=$1", [userId]);
+        if (user.rows.length === 0) return res.status(404).json({ message: "Utilisateur non trouvé" });
+
+        // Chercher les transactions de dépôt récentes (dernières 24h)
+        const recentDeposits = await db.query(
+            "SELECT reference, amount, created_at FROM public.transactions WHERE user_id=$1 AND type='deposit' AND created_at > NOW() - INTERVAL '24 hours' ORDER BY created_at DESC LIMIT 5",
+            [userId]
+        );
+
+        res.json({
+            balance: parseFloat(user.rows[0].balance),
+            recent_deposits: recentDeposits.rows,
+            message: `Solde: ${user.rows[0].balance} FCFA`
+        });
+    } catch (err) {
+        console.error('[DEPOSIT VERIFY ERROR]', err.message);
         res.status(500).json({ message: "Erreur serveur" });
     }
 });
@@ -2149,7 +2154,7 @@ app.post('/api/webhook', express.raw({ type: 'application/json' }), async (req, 
     const signature = req.headers['x-notch-signature'];
     const rawBody = req.body.toString();
 
-    console.log('[WEBHOOK] Reçu:', rawBody.substring(0, 200));
+    console.log('[WEBHOOK] Reçu:', rawBody.substring(0, 500));
 
     // Vérification de signature (si NOTCH_WEBHOOK_SECRET est configuré)
     if (process.env.NOTCH_WEBHOOK_SECRET) {
@@ -2174,16 +2179,39 @@ app.post('/api/webhook', express.raw({ type: 'application/json' }), async (req, 
         return res.status(400).send('Invalid JSON');
     }
 
-    console.log('[WEBHOOK] Event:', event.type, event.data?.reference || '');
+    // Log complet pour debug
+    console.log('[WEBHOOK] Event type:', event.event || event.type);
+    console.log('[WEBHOOK] Reference (top):', event.reference);
+    console.log('[WEBHOOK] Data:', JSON.stringify(event.data || {}));
 
-    if (event.type === 'payment.complete') {
-        const { amount, reference } = event.data;
+    const eventType = event.event || event.type;
+
+    if (eventType === 'payment.complete') {
+        // Notch Pay envoie les données soit dans data, soit au niveau racine
+        const data = event.data || {};
+        const reference = data.reference || data.trxref || event.reference || '';
+        const amount = parseFloat(data.amount || event.amount || 0);
+        const status = data.status || event.status || '';
+
+        console.log('[WEBHOOK] Processing:', reference, 'Amount:', amount, 'Status:', status);
+
+        if (!reference) {
+            console.error('[WEBHOOK] Aucune référence trouvée');
+            return res.status(200).send('OK - No reference');
+        }
 
         // Dépôt classique (balance G-Caisse)
         if (reference.startsWith('DEP_')) {
             const userId = reference.split('_')[1];
             if (userId) {
                 try {
+                    // Vérifier si déjà traité
+                    const existing = await db.query("SELECT id FROM public.transactions WHERE reference=$1", [reference]);
+                    if (existing.rows.length > 0) {
+                        console.log('[WEBHOOK] Déjà traité:', reference);
+                        return res.status(200).send('OK - Already processed');
+                    }
+
                     await db.query('BEGIN');
                     await db.query("UPDATE public.users SET balance = balance + $1 WHERE id=$2", [amount, userId]);
                     await db.query(
@@ -2191,9 +2219,11 @@ app.post('/api/webhook', express.raw({ type: 'application/json' }), async (req, 
                         [userId, amount, reference]
                     );
                     await db.query('COMMIT');
+                    console.log('[WEBHOOK] Dépôt crédité:', amount, 'FCFA pour user', userId);
                     return res.status(200).send('OK');
                 } catch (err) {
                     await db.query('ROLLBACK').catch(() => {});
+                    console.error('[WEBHOOK DEP ERROR]', err.message);
                     return res.status(500).send('DB Error');
                 }
             }
@@ -2206,7 +2236,6 @@ app.post('/api/webhook', express.raw({ type: 'application/json' }), async (req, 
                 if (pending.rows.length === 0) return res.status(200).send('Already processed');
                 const pt = pending.rows[0];
 
-                // Envoyer l'argent au destinataire via Notch Pay
                 const notchChannel = pt.receiver_operator === 'cm.orange' ? 'cm.orange' : 'cm.mtn';
                 const formattedReceiverPhone = pt.receiver_phone.startsWith('+') ? pt.receiver_phone : `+237${pt.receiver_phone.replace(/^0/, '')}`;
                 await axios.post('https://api.notchpay.co/transfers', {
@@ -2224,7 +2253,6 @@ app.post('/api/webhook', express.raw({ type: 'application/json' }), async (req, 
                     }
                 });
 
-                // Marquer comme complété
                 await db.query("UPDATE public.pending_transfers SET status='completed' WHERE id=$1", [pt.id]);
                 await db.query(
                     "INSERT INTO public.transactions (user_id, amount, type, status, reference, description) VALUES ($1,$2,'transfer_out','completed',$3,$4)",
@@ -2238,50 +2266,29 @@ app.post('/api/webhook', express.raw({ type: 'application/json' }), async (req, 
             }
         }
 
-        // Paiement de facture (ENEO, CamWater, etc.)
+        // Paiement de facture
         if (reference.startsWith('BILL_')) {
             try {
                 const pending = await db.query("SELECT * FROM public.pending_transfers WHERE payment_reference=$1 AND status='pending'", [reference]);
                 if (pending.rows.length === 0) return res.status(200).send('Already processed');
                 const pt = pending.rows[0];
-                const billName = pt.receiver_phone.replace('BILL_', '');
-
-                // Marquer comme payé
                 await db.query("UPDATE public.pending_transfers SET status='completed' WHERE id=$1", [pt.id]);
                 await db.query(
                     "INSERT INTO public.transactions (user_id, amount, type, status, reference, description) VALUES ($1,$2,'bill','completed',$3,$4)",
-                    [pt.sender_id, pt.amount, reference, `Facture ${billName} payée`]
+                    [pt.sender_id, pt.amount, reference, `Facture payée - ${pt.receiver_phone}`]
                 );
                 return res.status(200).send('OK');
             } catch (err) {
                 console.error('[WEBHOOK BILL ERROR]', err.message);
-                await db.query("UPDATE public.pending_transfers SET status='failed' WHERE payment_reference=$1", [reference]).catch(() => {});
-                return res.status(500).send('Bill Error');
+                return res.status(500).send('Error');
             }
         }
 
-        // Recharge airtime/data
-        if (reference.startsWith('AIR_')) {
-            try {
-                const pending = await db.query("SELECT * FROM public.pending_transfers WHERE payment_reference=$1 AND status='pending'", [reference]);
-                if (pending.rows.length === 0) return res.status(200).send('Already processed');
-                const pt = pending.rows[0];
-
-                // Marquer comme payé
-                await db.query("UPDATE public.pending_transfers SET status='completed' WHERE id=$1", [pt.id]);
-                await db.query(
-                    "INSERT INTO public.transactions (user_id, amount, type, status, reference, description) VALUES ($1,$2,'airtime','completed',$3,$4)",
-                    [pt.sender_id, pt.amount, reference, `Recharge ${pt.receiver_operator} - ${pt.receiver_phone}`]
-                );
-                return res.status(200).send('OK');
-            } catch (err) {
-                console.error('[WEBHOOK AIRTIME ERROR]', err.message);
-                await db.query("UPDATE public.pending_transfers SET status='failed' WHERE payment_reference=$1", [reference]).catch(() => {});
-                return res.status(500).send('Airtime Error');
-            }
-        }
+        // Référence non reconnue - log pour debug
+        console.log('[WEBHOOK] Référence non reconnue:', reference);
     }
-    res.status(200).send('Event ignored');
+
+    res.status(200).send('OK');
 });
 
 app.listen(port, () => console.log(`🚀 Serveur G-Caisse démarré sur le port ${port}`));
