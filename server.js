@@ -1122,7 +1122,7 @@ app.post('/api/deposit', authenticate, requireFields('amount', 'user_id', 'name'
             return res.status(400).json({ error: "URL de paiement non reçue", details: data });
         }
 
-        res.json({ success: true, payment_url: paymentUrl });
+        res.json({ success: true, payment_url: paymentUrl, reference });
     } catch (err) {
         const errData = err.response?.data;
         console.error('[NOTCH DEPOSIT ERROR]', {
@@ -1137,6 +1137,55 @@ app.post('/api/deposit', authenticate, requireFields('amount', 'user_id', 'name'
             details: errData?.message || errData?.error || err.message,
             status: err.response?.status
         });
+    }
+});
+
+// GET /api/deposit/status/:reference — Vérifier le statut d'un dépôt et créditer si payé
+app.get('/api/deposit/status/:reference', authenticate, async (req, res) => {
+    const { reference } = req.params;
+    try {
+        // Vérifier si déjà crédité dans les transactions
+        const existing = await db.query("SELECT id FROM public.transactions WHERE reference=$1 AND type='deposit'", [reference]);
+        if (existing.rows.length > 0) {
+            return res.json({ status: 'complete', message: 'Déjà crédité' });
+        }
+
+        // Interroger Notch Pay pour le statut
+        if (process.env.NOTCH_PUBLIC_KEY) {
+            try {
+                const npRes = await axios.get(`https://api.notchpay.co/payments/${reference}`, {
+                    headers: { 'Authorization': process.env.NOTCH_PUBLIC_KEY }
+                });
+                const payment = npRes.data?.transaction || npRes.data?.payment;
+                const status = payment?.status;
+
+                if (status === 'complete') {
+                    // Créditer le solde (fallback si le webhook n'a pas fonctionné)
+                    const userId = reference.split('_')[1];
+                    const amount = parseFloat(payment.amount);
+                    const alreadyExists = await db.query("SELECT id FROM public.transactions WHERE reference=$1 AND type='deposit'", [reference]);
+                    if (alreadyExists.rows.length === 0 && userId && amount > 0) {
+                        await db.query('BEGIN');
+                        await db.query("UPDATE public.users SET balance = balance + $1 WHERE id=$2", [amount, userId]);
+                        await db.query(
+                            "INSERT INTO public.transactions (user_id, amount, type, status, reference, description) VALUES ($1,$2,'deposit','completed',$3,'Dépôt confirmé')",
+                            [userId, amount, reference]
+                        );
+                        await db.query('COMMIT');
+                        console.log(`[DEPOSIT FALLBACK] Crédité ${amount} FCFA pour user ${userId} via vérification statut`);
+                    }
+                    return res.json({ status: 'complete', amount });
+                }
+                return res.json({ status: status || 'pending' });
+            } catch (npErr) {
+                console.error('[DEPOSIT STATUS] Erreur Notch Pay:', npErr.message);
+            }
+        }
+
+        res.json({ status: 'pending', message: 'En attente de confirmation' });
+    } catch (err) {
+        console.error('[DEPOSIT STATUS ERROR]', err.message);
+        res.status(500).json({ message: "Erreur serveur" });
     }
 });
 
