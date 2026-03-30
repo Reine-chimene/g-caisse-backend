@@ -1086,8 +1086,9 @@ app.get('/api/tontines/:id/auctions', authenticate, async (req, res) => {
 
 // POST /api/deposit
 app.post('/api/deposit', authenticate, requireFields('amount', 'user_id', 'name'), async (req, res) => {
-    const { amount, user_id, name, email, phone } = req.body;
-    const reference = `DEP_${user_id}_${Date.now()}`;
+    const { amount, user_id, name, email, phone, reference: clientRef } = req.body;
+    const reference = clientRef || `DEP_${user_id}_${Date.now()}`;
+    console.log('[DEPOSIT] Référence:', reference, 'Montant:', amount);
     try {
         if (!process.env.NOTCH_PUBLIC_KEY) {
             console.error('[NOTCH] NOTCH_PUBLIC_KEY non configuré dans les variables d\'environnement');
@@ -1140,7 +1141,7 @@ app.post('/api/deposit', authenticate, requireFields('amount', 'user_id', 'name'
     }
 });
 
-// GET /api/deposit/status/:reference — Vérifier le statut d'un dépôt et créditer si payé
+// GET /api/deposit/status/:reference — Vérifier le statut d'un dépôt via Notch Pay et créditer si payé
 app.get('/api/deposit/status/:reference', authenticate, async (req, res) => {
     const { reference } = req.params;
     try {
@@ -1150,15 +1151,71 @@ app.get('/api/deposit/status/:reference', authenticate, async (req, res) => {
             return res.json({ status: 'complete', message: 'Déjà crédité' });
         }
 
-        // Vérifier aussi si un dépôt récent existe pour cet utilisateur
-        if (reference.startsWith('DEP_')) {
-            const userId = reference.split('_')[1];
-            const recentDeposit = await db.query(
-                "SELECT id FROM public.transactions WHERE user_id=$1 AND type='deposit' AND reference=$2",
-                [userId, reference]
-            );
-            if (recentDeposit.rows.length > 0) {
-                return res.json({ status: 'complete', message: 'Déjà crédité' });
+        // Interroger Notch Pay pour le statut
+        if (process.env.NOTCH_PUBLIC_KEY) {
+            try {
+                let tx = null;
+                // Lister les paiements récents et chercher notre référence
+                // (Notch Pay utilise des UUIDs en interne, notre référence peut être dans différents champs)
+                console.log('[DEPOSIT STATUS] Recherche paiement pour référence:', reference);
+                const listRes = await axios.get('https://api.notchpay.co/payments', {
+                    headers: { 'Authorization': process.env.NOTCH_PUBLIC_KEY }
+                });
+                const payments = listRes.data?.payments || listRes.data?.data || listRes.data || [];
+                console.log('[DEPOSIT STATUS] Nombre de paiements récupérés:', Array.isArray(payments) ? payments.length : 'N/A');
+                if (Array.isArray(payments) && payments.length > 0) {
+                    console.log('[DEPOSIT STATUS] Exemple paiement:', JSON.stringify(payments[0]).substring(0, 500));
+                }
+                if (Array.isArray(payments)) {
+                    // Chercher dans tous les champs possibles
+                    tx = payments.find(p => {
+                        const refs = [p.reference, p.trxref, p.external_reference, p.data?.reference, p.metadata?.reference, p.metadata?.trxref].filter(Boolean);
+                        return refs.includes(reference);
+                    });
+                    // Si pas trouvé et qu'on a un UUID, chercher directement par ID
+                    if (!tx && /^[0-9a-f]{8}-/.test(reference)) {
+                        tx = payments.find(p => p.id === reference || p.uuid === reference);
+                    }
+                    if (tx) {
+                        console.log('[DEPOSIT STATUS] Paiement trouvé dans la liste:', JSON.stringify(tx).substring(0, 300));
+                    } else {
+                        console.log('[DEPOSIT STATUS] Paiement non trouvé. Références disponibles:', payments.slice(0, 3).map(p => ({ ref: p.reference, trxref: p.trxref, status: p.status })));
+                    }
+                }
+
+                if (tx) {
+                    console.log('[DEPOSIT STATUS] Transaction trouvée:', JSON.stringify(tx).substring(0, 300));
+                    const status = tx?.status || '';
+                    const amount = parseFloat(tx?.amount || 0);
+                    const actualRef = tx?.reference || reference;
+
+                    if (status === 'complete' && amount > 0) {
+                        // Extraire userId depuis notre référence DEP_userId_timestamp
+                        let userId = null;
+                        if (actualRef.startsWith('DEP_')) {
+                            userId = actualRef.split('_')[1];
+                        } else if (reference.startsWith('DEP_')) {
+                            userId = reference.split('_')[1];
+                        }
+                        // Vérifier encore une fois si pas déjà crédité (anti-doublon)
+                        const refToCheck = actualRef.startsWith('DEP_') ? actualRef : reference;
+                        const check = await db.query("SELECT id FROM public.transactions WHERE reference=$1", [refToCheck]);
+                        if (check.rows.length === 0 && userId) {
+                            await db.query('BEGIN');
+                            await db.query("UPDATE public.users SET balance = balance + $1 WHERE id=$2", [amount, userId]);
+                            await db.query(
+                                "INSERT INTO public.transactions (user_id, amount, type, status, reference, description) VALUES ($1,$2,'deposit','completed',$3,'Dépôt Notch Pay')",
+                                [userId, amount, refToCheck]
+                            );
+                            await db.query('COMMIT');
+                            console.log(`[DEPOSIT STATUS] Crédité ${amount} FCFA pour user ${userId}`);
+                        }
+                        return res.json({ status: 'complete', amount });
+                    }
+                    return res.json({ status: status || 'pending' });
+                }
+            } catch (npErr) {
+                console.error('[DEPOSIT STATUS] Erreur Notch Pay:', npErr.response?.data || npErr.message);
             }
         }
 
@@ -1169,7 +1226,7 @@ app.get('/api/deposit/status/:reference', authenticate, async (req, res) => {
     }
 });
 
-// GET /api/deposit/verify/:userId — Vérifier les dépôts récents d'un utilisateur et créditer si nécessaire
+// GET /api/deposit/verify/:userId — Vérifier les dépôts Notch Pay et créditer si payé
 app.get('/api/deposit/verify/:userId', authenticate, async (req, res) => {
     const userId = req.params.userId;
     try {
@@ -1177,17 +1234,52 @@ app.get('/api/deposit/verify/:userId', authenticate, async (req, res) => {
         const user = await db.query("SELECT balance FROM public.users WHERE id=$1", [userId]);
         if (user.rows.length === 0) return res.status(404).json({ message: "Utilisateur non trouvé" });
 
-        // Chercher les transactions de dépôt récentes (dernières 24h)
-        const recentDeposits = await db.query(
-            "SELECT reference, amount, created_at FROM public.transactions WHERE user_id=$1 AND type='deposit' AND created_at > NOW() - INTERVAL '24 hours' ORDER BY created_at DESC LIMIT 5",
-            [userId]
-        );
+        // Chercher les transactions de dépôt récentes qui n'ont PAS encore été créditées
+        if (process.env.NOTCH_PUBLIC_KEY) {
+            try {
+                // Récupérer les paiements récents depuis Notch Pay
+                const npRes = await axios.get('https://api.notchpay.co/payments', {
+                    headers: { 'Authorization': process.env.NOTCH_PUBLIC_KEY }
+                });
+                const payments = npRes.data?.payments || npRes.data?.transactions || npRes.data?.data || [];
+                console.log('[DEPOSIT VERIFY] Paiements:', payments.length);
+                if (payments.length > 0) {
+                    console.log('[DEPOSIT VERIFY] Exemple paiement:', JSON.stringify(payments[0]).substring(0, 500));
+                }
 
-        res.json({
-            balance: parseFloat(user.rows[0].balance),
-            recent_deposits: recentDeposits.rows,
-            message: `Solde: ${user.rows[0].balance} FCFA`
-        });
+                for (const p of payments) {
+                    // Chercher notre référence dans TOUS les champs possibles
+                    const possibleRefs = [
+                        p.reference, p.trxref, p.external_reference,
+                        p.data?.reference, p.metadata?.reference, p.metadata?.trxref
+                    ].filter(Boolean);
+                    const ref = possibleRefs.find(r => r.startsWith('DEP_')) || '';
+                    const status = p.status || '';
+                    const amount = parseFloat(p.amount || 0);
+
+                    if (ref.startsWith(`DEP_${userId}_`) && status === 'complete' && amount > 0) {
+                        const existing = await db.query("SELECT id FROM public.transactions WHERE reference=$1", [ref]);
+                        if (existing.rows.length === 0) {
+                            await db.query('BEGIN');
+                            await db.query("UPDATE public.users SET balance = balance + $1 WHERE id=$2", [amount, userId]);
+                            await db.query(
+                                "INSERT INTO public.transactions (user_id, amount, type, status, reference, description) VALUES ($1,$2,'deposit','completed',$3,'Dépôt Notch Pay')",
+                                [userId, amount, ref]
+                            );
+                            await db.query('COMMIT');
+                            console.log(`[DEPOSIT VERIFY] Crédité ${amount} FCFA pour user ${userId}`);
+                        }
+                    }
+                }
+            } catch (npErr) {
+                console.error('[DEPOSIT VERIFY] Erreur Notch Pay:', npErr.response?.data || npErr.message);
+            }
+        }
+
+        // Retourner le solde mis à jour
+        const updatedUser = await db.query("SELECT balance FROM public.users WHERE id=$1", [userId]);
+        const balance = parseFloat(updatedUser.rows[0].balance);
+        res.json({ balance, message: `Solde: ${balance} FCFA` });
     } catch (err) {
         console.error('[DEPOSIT VERIFY ERROR]', err.message);
         res.status(500).json({ message: "Erreur serveur" });
@@ -2180,18 +2272,53 @@ app.post('/api/webhook', express.raw({ type: 'application/json' }), async (req, 
     }
 
     // Log complet pour debug
-    console.log('[WEBHOOK] Event type:', event.event || event.type);
+    console.log('[WEBHOOK] Event type:', event.event || event.type || event.name);
     console.log('[WEBHOOK] Reference (top):', event.reference);
-    console.log('[WEBHOOK] Data:', JSON.stringify(event.data || {}));
+    console.log('[WEBHOOK] Payload:', JSON.stringify(event.payload || {}).substring(0, 300));
+    console.log('[WEBHOOK] Data:', JSON.stringify(event.data || {}).substring(0, 300));
 
-    const eventType = event.event || event.type;
+    const eventType = event.event || event.type || event.name;
 
     if (eventType === 'payment.complete') {
-        // Notch Pay envoie les données soit dans data, soit au niveau racine
-        const data = event.data || {};
-        const reference = data.reference || data.trxref || event.reference || '';
-        const amount = parseFloat(data.amount || event.amount || 0);
-        const status = data.status || event.status || '';
+        // Notch Pay envoie les données dans event.payload, event.data, ou au niveau racine
+        const payloadData = event.payload?.data || {};
+        const payload = event.payload || {};
+        let data = event.data && Object.keys(event.data).length > 0 ? event.data : payloadData;
+        
+        // Si data est vide, essayer d'utiliser le payload lui-même ou les champs racine
+        if (!data || Object.keys(data).length === 0) {
+            data = payload && Object.keys(payload).length > 1 ? payload : event;
+        }
+
+        let reference = data.reference || data.trxref || event.reference || payload.id || '';
+        let amount = parseFloat(data.amount || event.amount || 0);
+        let status = data.status || event.status || 'complete';
+
+        // Si data est vide ou la référence est un UUID Notch Pay (pas notre DEP_/XFER_/BILL_),
+        // requêter l'API Notch Pay pour obtenir les vrais détails du paiement
+        const isOurRef = reference.startsWith('DEP_') || reference.startsWith('XFER_') || reference.startsWith('BILL_') || reference.startsWith('AIR_');
+        if ((!isOurRef || !amount) && reference && process.env.NOTCH_PUBLIC_KEY) {
+            try {
+                console.log('[WEBHOOK] Référence UUID détectée, requête API Notch Pay:', reference);
+                const npRes = await axios.get(`https://api.notchpay.co/payments/${reference}`, {
+                    headers: { 'Authorization': process.env.NOTCH_PUBLIC_KEY }
+                });
+                const tx = npRes.data?.transaction || npRes.data?.data || npRes.data;
+                console.log('[WEBHOOK] Détails Notch Pay:', JSON.stringify(tx).substring(0, 500));
+                if (tx) {
+                    reference = tx.reference || tx.trxref || reference;
+                    amount = parseFloat(tx.amount || amount || 0);
+                    status = tx.status || status || '';
+                    data = tx;
+                    console.log('[WEBHOOK] Référence extraite:', reference, 'Montant:', amount);
+                }
+            } catch (npErr) {
+                console.error('[WEBHOOK] Erreur requête Notch Pay:', npErr.response?.data || npErr.message);
+            }
+        }
+        
+        // Re-vérifier si la référence est maintenant la nôtre après la requête API
+        const isOurRefNow = reference.startsWith('DEP_') || reference.startsWith('XFER_') || reference.startsWith('BILL_') || reference.startsWith('AIR_');
 
         console.log('[WEBHOOK] Processing:', reference, 'Amount:', amount, 'Status:', status);
 
