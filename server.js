@@ -2294,23 +2294,36 @@ app.post('/api/webhook', express.raw({ type: 'application/json' }), async (req, 
         let credited = false;
         try {
             await db.query('BEGIN');
-            const updResult = await db.query(`
-                UPDATE public.transactions
-                SET status = 'completed', description = 'Dépôt Notch Pay confirmé'
-                WHERE reference = $1 AND type = 'deposit' AND status = 'pending'
-                RETURNING user_id, amount, reference
-            `, [reference]);
-
-            if (updResult.rows.length > 0) {
-                const tx = updResult.rows[0];
-                const txAmount = parseFloat(tx.amount);
-                if (txAmount > 0) {
-                    await db.query(
-                        "UPDATE public.users SET balance = balance + $1 WHERE id = $2",
-                        [txAmount, tx.user_id]
-                    );
-                    credited = true;
-                    console.log('[WEBHOOK] ✅ CRÉDITÉ:', txAmount, 'FCFA → user', tx.user_id, 'Réf:', tx.reference);
+            
+            // Récupérer d'abord la transaction pour avoir le user_id
+            const txQuery = await db.query(
+                "SELECT user_id, amount FROM public.transactions WHERE reference = $1 AND type = 'deposit' AND status = 'pending'",
+                [reference]
+            );
+            
+            if (txQuery.rows.length > 0) {
+                const tx = txQuery.rows[0];
+                // Utiliser le montant de Notch Pay si disponible, sinon celui de la BD
+                const finalAmount = amount > 0 ? amount : parseFloat(tx.amount);
+                
+                if (finalAmount > 0) {
+                    // Mettre à jour la transaction avec le montant réel de Notch Pay
+                    const updResult = await db.query(`
+                        UPDATE public.transactions
+                        SET status = 'completed', amount = $1, description = 'Dépôt Notch Pay confirmé'
+                        WHERE reference = $2 AND type = 'deposit' AND status = 'pending'
+                        RETURNING id
+                    `, [finalAmount, reference]);
+                    
+                    if (updResult.rows.length > 0) {
+                        // Créditer le compte avec le montant réel de Notch Pay
+                        await db.query(
+                            "UPDATE public.users SET balance = balance + $1 WHERE id = $2",
+                            [finalAmount, tx.user_id]
+                        );
+                        credited = true;
+                        console.log('[WEBHOOK] ✅ CRÉDITÉ:', finalAmount, 'FCFA → user', tx.user_id, 'Réf:', reference, '(Montant Notch Pay:', amount, ')');
+                    }
                 }
             }
             await db.query('COMMIT');
