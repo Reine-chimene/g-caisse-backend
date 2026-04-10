@@ -662,7 +662,7 @@ app.post('/api/payments/tontine', authenticate, requireFields('user_id', 'tontin
             );
         }
         await db.query('COMMIT');
-        applyRoundUp(user_id, amount);
+        await applyRoundUp(user_id, amount);
         res.json({ message: "Paiement effectué" });
     } catch (err) {
         await db.query('ROLLBACK');
@@ -1368,7 +1368,7 @@ app.post('/api/transfer', authenticate, requireFields('sender_id', 'receiver_pho
             await db.query("INSERT INTO public.transactions (user_id, amount, type, status, description) VALUES ($1,$2,'transfer_out','completed','Transfert envoyé')", [sender_id, amount]);
             await db.query("INSERT INTO public.transactions (user_id, amount, type, status, description) VALUES ($1,$2,'transfer_in','completed','Transfert reçu')", [receiverId, amount]);
             await db.query('COMMIT');
-            applyRoundUp(sender_id, amount);
+            await applyRoundUp(sender_id, amount);
             res.json({ message: "Transfert effectué" });
         }
     } catch (err) {
